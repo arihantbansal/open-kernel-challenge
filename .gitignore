@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+out/
+.DS_Store
+*.cubin
+*.sass
+*.ptx
+*.o
+*.so
+*.nsys-rep
+*.ncu-rep
+.env
+.env.*

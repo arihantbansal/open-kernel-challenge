@@ -1,0 +1,2592 @@
+#!/usr/bin/env python3
+"""precheck: catch Open Kernel Challenge failures locally, before spending an `okc check`.
+
+    tools/precheck <submission.py> [--problem NAME] [--lint-only] [--no-trace] [--json]
+
+Stage 1 (lint) is pure Python on the host. Stages 2-4 run inside the okc-precheck Docker
+image (tools/Dockerfile: CUDA 13.0.3, torch 2.14.1+cu130, triton 3.8.0, arm64, no GPU):
+  2. build: every load_inline / cpp_extension.load the file makes, with its own flags, for
+     the judge's arch defaults, plus ptxas -v resource usage per kernel;
+  3. trace: prepare() and kernel_fn() run on an emulated H200 (meta tensors, stubbed CUDA
+     runtime and stubbed sglang/flashinfer/...) over the scored shapes, the judge's test
+     shapes and nearby shapes, recording host syncs, exceptions and launches (verdicts: trace_status);
+  4. triton: every @triton.jit specialization the trace launched, compiled for sm_90a,
+     with registers, spills and shared memory.
+See the Tools section of README.md for what each stage catches and what it cannot.
+Import checks use an optional source tree supplied with --scout or OKC_SCOUT; without it, import inspection is explicitly skipped.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ast
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+IMAGE = "okc-precheck:cu130-torch2.14.1"
+# The judge finds CUTLASS/CuTe headers through flashinfer (`from flashinfer.jit.env import CUTLASS_INCLUDE_DIRS`,
+# which is <site-packages>/flashinfer/data/cutlass/{include,tools/util/include}). The precheck image has no
+# flashinfer, so precheck extracts that tree once from the judge's own flashinfer wheel (0.7.0.post1, the version
+# the judge image prints) into CUTLASS_CACHE, mounts it read-only at the judge's path, and gives the stubbed
+# flashinfer.jit.env the judge's CUTLASS_INCLUDE_DIRS. Delete the cache directory to refetch.
+FLASHINFER_WHEEL = ("https://files.pythonhosted.org/packages/00/7d/16237087a2af99086ef4ae9808dff9b24f0a4db4cfd673233836821a32e0/"
+                    "flashinfer_python-0.7.0.post1-py3-none-any.whl",
+                    "c7adf826568d61fc1b7d3aadd4cae387a35a138bfc08e2deca2f34ecfa280716")
+CUTLASS_CACHE = Path(os.environ.get("OKC_CUTLASS_CACHE", "~/.cache/okc/cutlass-include/flashinfer-0.7.0.post1")).expanduser()
+JUDGE_CUTLASS = "/opt/sglang/lib/python3.12/site-packages/flashinfer/data/cutlass"
+TOOLS_DIR = Path(__file__).resolve().parent
+ROOT = TOOLS_DIR.parent  # okc-lab/
+PROBLEMS = ("muse_bf16_proj", "muse_attention_decode", "muse_moe_w4a16", "muse_decode_layer", "muse_prefill_layer")
+NO_WEIGHTS = ("muse_attention_decode",)
+PREPARE_LIMIT_S = 300
+SEVERITIES = ("ERROR", "WARN", "INFO")
+
+
+@dataclass
+class Finding:
+    stage: str
+    severity: str
+    line: int
+    rule: str
+    message: str
+
+
+@dataclass
+class Report:
+    path: str
+    problem: str | None
+    findings: list[Finding] = field(default_factory=list)
+    stages: dict = field(default_factory=dict)  # stage -> {"status": PASS/FAIL/SKIP, "why": str}
+    details: dict = field(default_factory=dict)
+
+    def add(self, stage, severity, line, rule, message):
+        self.findings.append(Finding(stage, severity, int(line or 0), rule, message))
+
+
+# =========================================================================================
+# Stage 1: static lint (host, no Docker)
+# =========================================================================================
+
+PROCESS_MODULES = {"subprocess", "multiprocessing", "pty", "pexpect"}
+NETWORK_MODULES = {"socket", "urllib", "urllib2", "urllib3", "http", "requests", "httpx", "aiohttp", "ftplib",
+                   "smtplib", "telnetlib", "xmlrpc", "websocket", "websockets", "paramiko", "ssl", "grpc"}
+OS_PROCESS = {"system", "popen", "fork", "forkpty", "posix_spawn", "posix_spawnp", "kill", "killpg", "_exit",
+              "execv", "execve", "execl", "execle", "execlp", "execlpe", "execvp", "execvpe",
+              "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe"}
+OS_FILE_MUTATE = {"remove", "unlink", "rename", "replace", "rmdir", "removedirs", "chmod", "chown", "truncate",
+                  "symlink", "link", "dup2", "close", "write"}
+FRAME_CALLS = {("sys", "_getframe"), ("sys", "settrace"), ("sys", "setprofile"), ("sys", "_current_frames"),
+               ("inspect", "currentframe"), ("inspect", "stack"), ("inspect", "getouterframes"),
+               ("inspect", "getinnerframes"), ("inspect", "trace"), ("traceback", "extract_stack"),
+               ("traceback", "walk_stack"), ("traceback", "format_stack"), ("traceback", "print_stack"),
+               ("gc", "get_objects"), ("gc", "get_referrers"), ("gc", "get_referents"),
+               ("threading", "settrace"), ("threading", "setprofile")}
+FRAME_ATTRS = {"f_back", "f_globals", "f_locals", "f_builtins", "tb_frame", "gi_frame", "cr_frame"}
+SECRET_RE = re.compile(r"TOKEN|SECRET|PASSW|CRED|AUTH|API_?KEY|PRIVATE", re.I)
+DIAG_NAME_RE = re.compile(r"diag|selftest|self_test|bench|debug|profil|_dump|trace(?!_)|sweep", re.I)
+MODE_FLAG_RE = re.compile(r"(DIAG|DEBUG|VERBOSE|SELFTEST|SELF_TEST|PROFILE|BENCH|DUMP|TRACE|FORCE|EXPERIMENT)", re.I)
+SYNC_METHODS = {"item": "host sync", "cpu": "device-to-host copy", "tolist": "host sync", "numpy": "host sync"}
+VALUE_SHAPE_FUNCS = {"nonzero", "argwhere", "masked_select", "unique", "unique_consecutive"}
+REDUCERS = {"sum", "max", "min", "mean", "norm", "amax", "amin", "argmax", "argmin", "any", "all", "prod",
+            "std", "var", "count_nonzero", "item", "abs"}
+TIMING_MARKERS = {"CUDAGraph", "Event", "elapsed_time", "do_bench", "do_bench_cudagraph", "perf_counter",
+                  "graph", "synchronize"}
+IMAGE_PACKAGES = {"torch", "triton", "numpy", "sglang", "sgl_kernel", "flashinfer", "deep_gemm", "quack", "cutlass",
+                  "cuda", "tilelang", "tvm", "tvm_ffi", "flash_attn", "flash_attn_interface", "hpc", "humming",
+                  "einops", "transformers", "safetensors", "packaging", "typing_extensions", "jinja2", "sympy",
+                  "nvidia", "cupy", "pydantic", "deep_ep", "sgl_deep_gemm", "torchvision", "flash_mla", "psutil"}
+PROBLEM_LOCAL = {"nvfp4"}  # shipped beside reference.py by the judge
+SCOUT_ROOTS = {  # package -> source root inside the scout clones (OKC_SCOUT), exact for sglang
+    "sglang": ("sglang/python", "ERROR"),
+    "sgl_kernel": ("sglang/kernels/aot/python", "WARN"),
+    "flashinfer": ("flashinfer", "WARN"),
+    "quack": ("quack", "WARN"),
+    "deep_gemm": ("deepgemm", "WARN"),
+    "tilelang": ("tilelang", "WARN"),
+}
+BUILD_FUNCS = {"load_inline", "load"}
+
+
+def dotted(node):
+    """'a.b.c' for Name/Attribute chains, else None."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    if isinstance(node, ast.Call):  # torch.cuda.current_stream().synchronize
+        inner = dotted(node.func)
+        if inner:
+            parts.append(inner + "()")
+            return ".".join(reversed(parts))
+    return None
+
+
+def const_str(node):
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+class Module:
+    """Parsed submission with a name-level call graph over top-level functions."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.src = path.read_text()
+        self.tree = ast.parse(self.src, filename=str(path))
+        self.lines = self.src.splitlines()
+        self.funcs: dict[str, ast.FunctionDef] = {}
+        self.classes: dict[str, ast.ClassDef] = {}
+        self.consts: dict[str, ast.AST] = {}
+        self.module_aliases: dict[str, str] = {}  # local name -> module it names
+        self.from_names: dict[str, str] = {}  # local name -> 'pkg.mod.name'
+        self.parent: dict[ast.AST, ast.AST] = {}
+        for node in ast.walk(self.tree):
+            for child in ast.iter_child_nodes(node):
+                self.parent[child] = node
+        for node in self.tree.body:
+            self._index_top(node)
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    self.module_aliases[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name.split(".")[0]
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                for a in node.names:
+                    self.from_names[a.asname or a.name] = f"{node.module}.{a.name}"
+        self.triton_kernels = {n for n, f in self.funcs.items() if self.is_triton(f)}
+        self.refs = {n: self._refs(f) for n, f in {**self.funcs, **self.classes}.items()}
+
+    def _index_top(self, node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self.funcs[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            self.classes[node.name] = node
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    self.consts[t.id] = node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            self.consts[node.target.id] = node.value
+        elif isinstance(node, (ast.If, ast.Try)):
+            for sub in node.body + getattr(node, "orelse", []) + getattr(node, "finalbody", []):
+                self._index_top(sub)
+            for h in getattr(node, "handlers", []):
+                for sub in h.body:
+                    self._index_top(sub)
+
+    @staticmethod
+    def is_triton(f):
+        for d in f.decorator_list:
+            name = dotted(d.func if isinstance(d, ast.Call) else d) or ""
+            if name.split(".")[-1] in ("jit", "autotune", "heuristics") and "triton" in name or name in ("jit",):
+                return True
+        return False
+
+    def _refs(self, node):
+        names = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                names.add(n.id)
+        return names & (set(self.funcs) | set(self.classes))
+
+    def closure(self, roots):
+        seen, todo = set(), [r for r in roots if r in self.refs]
+        while todo:
+            n = todo.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            if n in self.triton_kernels:
+                continue  # device code: no Python-level hazards inside
+            todo.extend(self.refs.get(n, ()))
+        return seen
+
+    def module_level_refs(self):
+        """Functions referenced by top-level statements other than def/class (import-time code)."""
+        names = set()
+        for node in self.tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id in self.funcs:
+                    names.add(n.id)
+        return names
+
+    def module_level_calls(self):
+        """Top-level statements that call module functions at import, with the called names."""
+        out = []
+        for node in self.tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom)):
+                continue
+            called = []
+            for n in ast.walk(node):
+                if isinstance(n, ast.Call):
+                    name = dotted(n.func)
+                    if name in self.funcs:
+                        called.append((name, n.lineno))
+            if called:
+                out.append((node, called))
+        return out
+
+    def enclosing_function(self, node):
+        p = self.parent.get(node)
+        while p is not None and not isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            p = self.parent.get(p)
+        return p
+
+    def top_function_of(self, node):
+        """The top-level function containing node (nested defs resolve to their outer function)."""
+        p, top = node, None
+        while p is not None:
+            if isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef)) and p.name in self.funcs and self.funcs[p.name] is p:
+                top = p
+            p = self.parent.get(p)
+        return top
+
+    def try_eval(self, node, depth=0):
+        """Constant-fold an expression using top-level constants; raises on anything else."""
+        if depth > 20:
+            raise ValueError("too deep")
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in self.consts:
+            return self.try_eval(self.consts[node.id], depth + 1)
+        if isinstance(node, (ast.List, ast.Tuple)):
+            out = []
+            for e in node.elts:
+                if isinstance(e, ast.Starred):
+                    out.extend(self.try_eval(e.value, depth + 1))
+                else:
+                    out.append(self.try_eval(e, depth + 1))
+            return out
+        if isinstance(node, ast.BinOp):
+            a, b = self.try_eval(node.left, depth + 1), self.try_eval(node.right, depth + 1)
+            ops = {ast.Add: lambda: a + b, ast.Sub: lambda: a - b, ast.Mult: lambda: a * b,
+                   ast.FloorDiv: lambda: a // b, ast.LShift: lambda: a << b, ast.Pow: lambda: a ** b,
+                   ast.Div: lambda: a / b, ast.Mod: lambda: a % b}
+            if type(node.op) in ops:
+                return ops[type(node.op)]()
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -self.try_eval(node.operand, depth + 1)
+        if isinstance(node, ast.JoinedStr):
+            raise ValueError("f-string")
+        raise ValueError(f"not constant: {type(node).__name__}")
+
+
+def call_name(call: ast.Call) -> str:
+    return dotted(call.func) or ""
+
+
+def walk_scope(fn):
+    """All nodes of a function including nested functions and lambdas."""
+    return ast.walk(fn)
+
+
+def is_broad_handler(h: ast.ExceptHandler):
+    if h.type is None:
+        return True
+    names = [dotted(e) for e in (h.type.elts if isinstance(h.type, ast.Tuple) else [h.type])]
+    return any(n in ("Exception", "BaseException", "RuntimeError", "OSError", "ImportError") for n in names)
+
+
+def handler_reraises(h: ast.ExceptHandler):
+    return any(isinstance(n, ast.Raise) for n in ast.walk(h))
+
+
+def swallowing_try(mod: Module, node):
+    """The innermost enclosing try (within the function) that swallows a broad exception, or None."""
+    p, child = mod.parent.get(node), node
+    while p is not None and not isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+        if isinstance(p, ast.Try) and child in p.body:
+            for h in p.handlers:
+                if is_broad_handler(h) and not handler_reraises(h):
+                    return p
+        child, p = p, mod.parent.get(p)
+    return None
+
+
+def lint(mod: Module, rep: Report, problem: str | None, scout: Path | None):
+    S = "lint"
+    first = mod.lines[0] if mod.lines else ""
+    m = re.match(r"#\s*okc:\s*problem=(\S+)", first)
+    if not m:
+        rep.add(S, "ERROR", 1, "header", "first line must be `# okc: problem=<name>`; `okc check/submit` reads the problem from it")
+    elif m.group(1) not in PROBLEMS:
+        rep.add(S, "ERROR", 1, "header", f"unknown problem {m.group(1)!r} in the first line")
+    elif problem and m.group(1) != problem:
+        rep.add(S, "ERROR", 1, "header", f"first line names {m.group(1)}, but --problem is {problem}")
+
+    # ---- entry points
+    kf = mod.funcs.get("kernel_fn")
+    if kf is None:
+        rep.add(S, "ERROR", 1, "entry", "no top-level `kernel_fn` defined")
+    elif problem:
+        nreq = len(kf.args.args) - len(kf.args.defaults)
+        want = 1 if problem in NO_WEIGHTS else 2
+        if nreq != want and not (kf.args.vararg and nreq <= want):
+            rep.add(S, "ERROR", kf.lineno, "entry",
+                    f"kernel_fn takes {nreq} required args; {problem} calls kernel_fn({'data' if want == 1 else 'data, state'})")
+    if problem and problem not in NO_WEIGHTS and "prepare" not in mod.funcs:
+        rep.add(S, "ERROR", 1, "entry", f"{problem} has weights: define prepare(weights) returning the state kernel_fn gets")
+
+    kernel_scope = mod.closure(["kernel_fn"]) - mod.triton_kernels
+    prepare_scope = mod.closure(["prepare"]) - mod.triton_kernels - kernel_scope
+    import_roots = mod.module_level_refs()
+    import_scope = mod.closure(import_roots) - mod.triton_kernels
+    rep.details["scopes"] = {"kernel_fn": sorted(kernel_scope), "prepare_only": sorted(prepare_scope),
+                             "import_time": sorted(import_scope)}
+
+    # ---- whole-file rules: what the judge rejects
+    for node in ast.walk(mod.tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            mods = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+            for name in mods:
+                top = name.split(".")[0]
+                if top == "reference":
+                    rep.add(S, "ERROR", line, "reject.reference", "imports the judge's reference: rejected before running")
+                elif top == "checks":
+                    rep.add(S, "WARN", line, "harness", "imports checks.py, the judge's harness spec")
+                elif top == "baseline":
+                    rep.add(S, "WARN", line, "harness", "imports baseline.py; the judge's copy is not guaranteed to be importable")
+                elif top in PROCESS_MODULES:
+                    rep.add(S, "ERROR", line, "reject.process", f"imports {name}: starting processes is rejected")
+                elif top in NETWORK_MODULES:
+                    rep.add(S, "ERROR", line, "reject.network", f"imports {name}: network use is rejected")
+                elif top in ("ctypes", "cffi"):
+                    rep.add(S, "WARN", line, "lowlevel", f"imports {top}: reviewers will read this closely")
+                elif top in ("pdb", "ipdb", "code"):
+                    rep.add(S, "ERROR", line, "debugger", f"imports {top}")
+                elif top in ("atexit", "signal", "threading", "faulthandler"):
+                    rep.add(S, "INFO", line, "background", f"imports {top}: work outside the timed calls or harness hooks")
+                elif top == "importlib":
+                    rep.add(S, "WARN", line, "dynamic-import", "imports importlib (reload or dynamic imports)")
+                elif top in PROBLEM_LOCAL:
+                    rep.add(S, "INFO", line, "imports", f"imports {top}, which the judge ships beside reference.py")
+                elif top and top not in IMAGE_PACKAGES and top not in sys.stdlib_module_names and top != "__future__":
+                    rep.add(S, "WARN", line, "imports", f"{top!r} is not a package known to be in the judge image")
+        elif isinstance(node, ast.Call):
+            name = call_name(node)
+            parts = name.split(".")
+            if len(parts) >= 2 and parts[-2] == "os" and parts[-1] in OS_PROCESS:
+                rep.add(S, "ERROR", line, "reject.process", f"{name}(): starting processes or exiting is rejected")
+            elif len(parts) >= 2 and (parts[-2], parts[-1]) in FRAME_CALLS:
+                rep.add(S, "ERROR", line, "reject.frames", f"{name}(): reading harness frames/objects is rejected")
+            elif name in ("sys.exit", "exit", "quit", "breakpoint"):
+                rep.add(S, "ERROR", line, "exit", f"{name}() would end or stall the judge's process")
+            elif name in ("exec", "eval", "compile", "__import__"):
+                arg = const_str(node.args[0]) if node.args else None
+                if name == "__import__" and arg and arg.split(".")[0] == "reference":
+                    rep.add(S, "ERROR", line, "reject.reference", "__import__('reference')")
+                else:
+                    rep.add(S, "WARN", line, "dynamic-code", f"{name}() of dynamic code: reviewers will read this closely")
+            elif name in ("importlib.import_module", "importlib.reload"):
+                arg = const_str(node.args[0]) if node.args else None
+                sev = "ERROR" if arg and arg.split(".")[0] == "reference" else "WARN"
+                rep.add(S, sev, line, "dynamic-import", f"{name}({arg or '...'})")
+            elif name == "setattr" and node.args:
+                root = (dotted(node.args[0]) or "").split(".")[0]
+                if root in mod.module_aliases:
+                    rep.add(S, "ERROR", line, "reject.monkeypatch", f"setattr on module {dotted(node.args[0])}: editing loaded modules is rejected")
+            elif name in ("os.environ.get", "os.getenv", "os.environ.setdefault", "os.environ.__getitem__"):
+                key = const_str(node.args[0]) if node.args else None
+                if key and SECRET_RE.search(key):
+                    rep.add(S, "ERROR", line, "reject.secrets", f"reads environment variable {key}: touching secrets is rejected")
+                elif name == "os.environ.setdefault":
+                    rep.add(S, "WARN", line, "env", f"sets {key} in the judge's environment")
+                else:
+                    default = ast.unparse(node.args[1]) if len(node.args) > 1 else "None"
+                    rep.add(S, "WARN", line, "mode.env",
+                            f"behaviour depends on env var {key} (default {default}); the judge does not set it, so the default runs")
+            elif name in ("os.environ.items", "os.environ.keys", "os.environ.values", "os.environ.copy") or \
+                    (name == "dict" and node.args and dotted(node.args[0]) == "os.environ"):
+                rep.add(S, "ERROR", line, "reject.secrets", "reads the whole environment (secrets)")
+            elif name == "os.putenv":
+                rep.add(S, "WARN", line, "env", "os.putenv changes the judge's environment")
+            elif len(parts) >= 2 and parts[-2] == "os" and parts[-1] in OS_FILE_MUTATE:
+                rep.add(S, "WARN", line, "harness.io", f"{name}(): file-system mutation; touching harness files is rejected")
+            elif parts[0] == "shutil":
+                rep.add(S, "WARN", line, "harness.io", f"{name}(): file-system mutation")
+            elif name == "open" or name.endswith(".write_text") or name.endswith(".write_bytes"):
+                mode = const_str(node.args[1]) if len(node.args) > 1 else None
+                for kw in node.keywords:
+                    if kw.arg == "mode":
+                        mode = const_str(kw.value)
+                target = ast.unparse(node.args[0]) if node.args else ""
+                writes = name != "open" or (mode and any(c in mode for c in "wax+"))
+                harnessy = re.search(r"reference|checks|judge|harness|__file__|stdout|stderr|/proc|\.py", target)
+                if writes and harnessy:
+                    rep.add(S, "ERROR", line, "reject.harness-io", f"writes {target}: touching harness files is rejected")
+                elif writes:
+                    rep.add(S, "WARN", line, "harness.io", f"writes a file ({target}); keep file I/O out of submissions")
+                else:
+                    rep.add(S, "WARN", line, "harness.io", f"reads a file at runtime ({target})")
+            elif name in ("atexit.register", "threading.Thread", "signal.signal"):
+                top = mod.top_function_of(node)
+                if name == "threading.Thread" and top is not None and top.name in mod.closure(["prepare"]):
+                    rep.add(S, "INFO", line, "background", f"{name}() in prepare (parallel work inside prepare's 300 s)")
+                else:
+                    rep.add(S, "WARN", line, "background", f"{name}(): work or hooks outside the timed calls")
+        elif isinstance(node, ast.Attribute) and node.attr in FRAME_ATTRS:
+            rep.add(S, "ERROR", line, "reject.frames", f".{node.attr}: reading frames is rejected")
+        elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+            targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+            for t in targets:
+                base = t.value if isinstance(t, ast.Subscript) else t
+                full = dotted(base) or ""
+                root = full.split(".")[0]
+                if isinstance(t, ast.Subscript) and full == "os.environ":
+                    key = const_str(t.slice)
+                    rep.add(S, "WARN", line, "env", f"sets os.environ[{key!r}] in the judge's process")
+                elif isinstance(t, ast.Subscript) and full == "sys.modules":
+                    rep.add(S, "ERROR", line, "reject.monkeypatch", "assigns into sys.modules: editing loaded modules is rejected")
+                elif isinstance(t, ast.Attribute) and root in mod.module_aliases:
+                    if re.match(r"(torch\.backends|torch\._dynamo\.config|torch\._inductor\.config|triton\.knobs)", full):
+                        rep.add(S, "WARN", line, "global-setting",
+                                f"sets {full}: a process-wide setting that also changes SGLang's timed baseline")
+                    elif full in ("sys.stdout", "sys.stderr", "sys.stdin"):
+                        rep.add(S, "ERROR", line, "reject.harness-io", f"replaces {full}: touching harness I/O is rejected")
+                    else:
+                        rep.add(S, "ERROR", line, "reject.monkeypatch",
+                                f"assigns {full}: editing loaded modules (timing, CUDA events, torch) is rejected")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and len(node.value) < 300:
+            if re.match(r"(/Users/|/home/|~/|/private/|C:\\)", node.value):
+                rep.add(S, "WARN", line, "local-path", f"hard-coded local path {node.value!r}")
+
+    # ---- CUDA-graph hazards, strict inside kernel_fn and what it calls
+    kernel_params = set()
+    if kf is not None:
+        kernel_params = {a.arg for a in kf.args.args}
+    for fname in sorted(kernel_scope):
+        fnode = mod.funcs.get(fname) or mod.classes.get(fname)
+        _graph_hazards(mod, rep, fnode, fname, kernel_params)
+
+    # ---- import-time work and leftovers
+    for node, called in mod.module_level_calls():
+        names = [c[0] for c in called]
+        line = node.lineno
+        reach = mod.closure(names) - mod.triton_kernels
+        diag = sorted(n for n in reach if DIAG_NAME_RE.search(n))
+        timing = sorted(n for n in reach if _has_timing(mod.funcs.get(n)))
+        if diag or timing:
+            rep.add(S, "WARN", line, "leftover.import-time",
+                    f"import runs {', '.join(names)} -> {', '.join(sorted(set(diag + timing)))}: diagnostic/benchmark code "
+                    "executes on the judge before any timed call (fine for a check run, remove before submitting)")
+        else:
+            rep.add(S, "INFO", line, "import-time", f"import-time call: {', '.join(names)}")
+    for node in mod.tree.body:
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and call_name(node.value) == "print":
+            rep.add(S, "INFO", node.lineno, "import-time", "prints at import")
+        for n in ast.walk(node) if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) else ():
+            if isinstance(n, ast.Call) and call_name(n).split(".")[-1] in ("empty", "zeros", "ones", "randn", "rand", "full", "arange", "empty_like") \
+                    and call_name(n).startswith("torch"):
+                size = _alloc_bytes(mod, n)
+                dev = next((ast.unparse(k.value) for k in n.keywords if k.arg == "device"), "cpu")
+                if "cuda" in dev or dev not in ("cpu", "'cpu'"):
+                    sev = "WARN" if size is None or size > (64 << 20) else "INFO"
+                    sz = f"{size / 2**20:.1f} MiB" if size is not None else "size not constant"
+                    rep.add(S, sev, n.lineno, "import-alloc", f"module-level GPU allocation ({sz}) at import, outside prepare()")
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Compare) and dotted(node.test.left) == "__name__":
+            rep.add(S, "INFO", node.lineno, "leftover", "`if __name__ == '__main__'` block (never runs on the judge)")
+
+    # mode flags
+    for name, value in mod.consts.items():
+        if MODE_FLAG_RE.search(name) and isinstance(value, ast.Constant) and len(str(value.value)) < 40:
+            node = next(n for n in mod.tree.body if isinstance(n, (ast.Assign, ast.AnnAssign)) and
+                        any(isinstance(t, ast.Name) and t.id == name for t in (n.targets if isinstance(n, ast.Assign) else [n.target])))
+            rep.add(S, "WARN" if value.value not in (False, None, 0, "") else "INFO", node.lineno, "leftover.mode",
+                    f"mode flag {name} = {value.value!r}")
+
+    # dead code / unused sources
+    used = set()
+    for n in ast.walk(mod.tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            used.add(n.id)
+    entry = {"kernel_fn", "prepare"}
+    for name, f in mod.funcs.items():
+        if name not in used and name not in entry:
+            sev = "WARN" if DIAG_NAME_RE.search(name) else "INFO"
+            rep.add(S, sev, f.lineno, "leftover.dead", f"function {name} is never referenced")
+    for name, f in mod.funcs.items():
+        if name in used and DIAG_NAME_RE.search(name) and name not in kernel_scope | prepare_scope | import_scope:
+            rep.add(S, "INFO", f.lineno, "leftover.dead", f"{name} is only reachable from other unused code")
+    for name, value in mod.consts.items():
+        s = const_str(value)
+        if s and len(s) > 2000 and name not in used:
+            rep.add(S, "WARN", value.lineno, "leftover.dead", f"source string {name} ({len(s.splitlines())} lines) is never used")
+
+    # ---- builds
+    builds = _build_sites(mod)
+    rep.details["build_sites"] = [{"line": b["line"], "func": b["func"], "flags": b.get("cuda_flags"),
+                                   "cflags": b.get("cflags"), "name": b.get("name")} for b in builds]
+    for b in builds:
+        flags = (b.get("cuda_flags") or []) + (b.get("cflags") or [])
+        for fl in flags:
+            mm = re.match(r"-std=(?:c|gnu)\+\+(\d+)", str(fl))
+            if mm and int(mm.group(1)) < 20 and int(mm.group(1)) > 3:
+                rep.add(S, "ERROR", b["line"], "build.std",
+                        f"{b['call']}({b.get('name') or ''!r}) passes {fl}: torch 2.14's ATen headers need C++20, so this build fails "
+                        "on the judge" + (" and the file silently falls back" if b.get("swallowed") else ""))
+        if b.get("cuda_flags") is not None and not any(str(f).startswith(("-gencode", "-arch", "--gpu-architecture", "-code"))
+                                                       for f in b["cuda_flags"]):
+            rep.add(S, "WARN", b["line"], "build.arch",
+                    "no -gencode/-arch flag: torch builds for the visible GPU (sm_90 + compute_90 PTX), so sm_90a-only "
+                    "features (wgmma, setmaxnreg, TMA multicast) won't compile; pass -gencode=arch=compute_90a,code=sm_90a")
+        if b.get("cuda_flags") is None and b.get("unresolved"):
+            rep.add(S, "INFO", b["line"], "build.flags", f"flags not statically resolvable: {b['unresolved']}")
+        if b.get("swallowed"):
+            t = b["swallowed"]
+            rep.add(S, "WARN", b["line"], "build.swallowed",
+                    f"a failure of this build is caught at line {t} and not re-raised: the file silently falls back to "
+                    "another path. The build stage below checks it compiles.")
+        if b.get("verbose"):
+            rep.add(S, "INFO", b["line"], "build.verbose", "verbose=True build output lands in the run log")
+        if b["func"] in kernel_scope:
+            rep.add(S, "WARN", b["line"], "build.in-kernel",
+                    f"{b['call']} is reachable from kernel_fn ({b['func']}); make sure it is cached and runs before capture")
+        where = "prepare()" if b["func"] in prepare_scope else ("import" if b["func"] in import_scope or b["func"] is None
+                                                                else "kernel_fn" if b["func"] in kernel_scope else "unreached")
+        b["where"] = where
+        if where == "unreached":
+            rep.add(S, "WARN", b["line"], "build.unreached", f"{b['call']} in {b['func']} is not reachable from import, prepare or kernel_fn")
+
+    # ---- prepare budget heuristics
+    if "prepare" in mod.funcs:
+        pscope = mod.closure(["prepare"]) - mod.triton_kernels
+        budgets = []
+        for fname in pscope:
+            f = mod.funcs.get(fname)
+            if f is None:
+                continue
+            for n in ast.walk(f):
+                if isinstance(n, ast.Compare) and len(n.comparators) == 1:
+                    sides = [n.left, n.comparators[0]]
+                    texts = [ast.unparse(s) for s in sides]
+                    if any(re.search(r"time\.(time|perf_counter|monotonic)\(\)", t) for t in texts):
+                        for s in sides:
+                            try:
+                                v = mod.try_eval(s)
+                                if isinstance(v, (int, float)) and 10 <= v <= 3600:
+                                    budgets.append((v, n.lineno, fname))
+                            except Exception:
+                                pass
+        tuning = sorted(n for n in pscope if _has_timing(mod.funcs.get(n)))
+        rep.details["prepare"] = {"budgets": budgets, "timing_funcs": tuning,
+                                  "builds_in_prepare": [b["line"] for b in builds if b.get("where") == "prepare()"]}
+        if budgets:
+            hi = max(budgets)
+            sev = "WARN" if hi[0] > 240 else "INFO"
+            rep.add(S, sev, hi[1], "prepare.budget",
+                    f"prepare's wall-clock guard tops out at {hi[0]:g} s (in {hi[2]}); the limit is {PREPARE_LIMIT_S} s and "
+                    "work after the last guard check (and the build, if it is in prepare) still counts")
+        elif tuning:
+            rep.add(S, "WARN", mod.funcs["prepare"].lineno, "prepare.budget",
+                    f"prepare times things ({', '.join(tuning)}) but has no wall-clock guard; it must finish in {PREPARE_LIMIT_S} s")
+
+    # ---- imports resolve against the image's sources (scout clones)
+    if scout and scout.is_dir():
+        _check_imports(mod, rep, scout)
+
+
+def _has_timing(f):
+    if f is None:
+        return False
+    for n in ast.walk(f):
+        if isinstance(n, ast.Call):
+            name = call_name(n)
+            last = name.split(".")[-1]
+            if last in ("CUDAGraph", "do_bench", "do_bench_cudagraph", "elapsed_time") or \
+                    (last == "Event" and any(k.arg == "enable_timing" for k in n.keywords)):
+                return True
+    return False
+
+
+def _alloc_bytes(mod, call):
+    sizes = {"float32": 4, "float": 4, "int32": 4, "bfloat16": 2, "float16": 2, "half": 2, "int64": 8, "long": 8,
+             "uint8": 1, "int8": 1, "float8_e4m3fn": 1, "int": 8, "bool": 1}
+    try:
+        shape = mod.try_eval(call.args[0]) if call.args else None
+        if isinstance(shape, int):
+            numel = shape
+        else:
+            numel = 1
+            for s in shape:
+                numel *= s
+        dt = next((k.value for k in call.keywords if k.arg == "dtype"), None)
+        esz = sizes.get(dt.attr if isinstance(dt, ast.Attribute) else "float32", 4)
+        return numel * esz
+    except Exception:
+        return None
+
+
+def _graph_hazards(mod, rep, fnode, fname, kernel_params):
+    S = "lint"
+    if fnode is None:
+        return
+    ctx = f"in {fname} (reached from kernel_fn)" if fname != "kernel_fn" else "in kernel_fn"
+    # a cached builder (contains load_inline) prints/times its own one-off build: not a per-call hazard
+    builder = any(isinstance(c, ast.Call) and call_name(c).split(".")[-1] in BUILD_FUNCS for c in ast.walk(fnode))
+    mask_names = set()
+    for n in ast.walk(fnode):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+            v = n.value
+            if isinstance(v, ast.Compare) or (isinstance(v, ast.Call) and call_name(v).split(".")[-1] in
+                                              ("bool", "isfinite", "isnan", "isinf", "logical_and", "logical_or", "logical_not",
+                                               "eq", "ne", "gt", "lt", "ge", "le")) or \
+                    (isinstance(v, ast.UnaryOp) and isinstance(v.op, ast.Invert)):
+                mask_names.add(n.targets[0].id)
+    for n in ast.walk(fnode):
+        line = getattr(n, "lineno", fnode.lineno)
+        if isinstance(n, ast.Call):
+            name = call_name(n)
+            last = name.split(".")[-1]
+            if isinstance(n.func, ast.Attribute) and last in SYNC_METHODS and not name.startswith(("tl.", "triton.")):
+                rep.add(S, "ERROR", line, "graph.sync", f".{last}() {ctx}: {SYNC_METHODS[last]}, breaks CUDA-graph capture")
+            elif last == "synchronize":
+                rep.add(S, "ERROR", line, "graph.sync", f"{name}() {ctx}: host sync, breaks CUDA-graph capture")
+            elif last == "to" and any((const_str(a) or "").startswith("cpu") for a in n.args) or \
+                    last == "to" and any(k.arg == "device" and "cpu" in ast.unparse(k.value) for k in n.keywords):
+                rep.add(S, "ERROR", line, "graph.sync", f"{name}('cpu') {ctx}: device-to-host copy")
+            elif last in VALUE_SHAPE_FUNCS and (name.startswith("torch.") or isinstance(n.func, ast.Attribute)) \
+                    and not name.startswith(("tl.", "triton.")):
+                rep.add(S, "ERROR", line, "graph.value-shape",
+                        f"{name}() {ctx}: output shape depends on values (host sync; not capturable)")
+            elif name == "torch.where" and len(n.args) == 1:
+                rep.add(S, "ERROR", line, "graph.value-shape", f"torch.where(cond) {ctx}: value-dependent shape")
+            elif last == "repeat_interleave" and not any(k.arg == "output_size" for k in n.keywords):
+                rep.add(S, "WARN", line, "graph.value-shape",
+                        f"{name}() {ctx} without output_size syncs when repeats is a tensor")
+            elif last == "bincount":
+                rep.add(S, "WARN", line, "graph.value-shape", f"{name}() {ctx}: output size depends on values")
+            elif name == "print" and not builder:
+                rep.add(S, "WARN", line, "graph.print",
+                        f"print() {ctx}: runs on every eager call, and printing a tensor value syncs")
+            elif name in ("int", "float", "bool") and n.args and _mentions_reduction(n.args[0]):
+                rep.add(S, "ERROR", line, "graph.sync", f"{name}({ast.unparse(n.args[0])[:60]}) {ctx}: tensor-to-Python conversion syncs")
+            elif name in ("torch.tensor", "torch.as_tensor", "torch.from_numpy") or last in ("cuda", "pin_memory") and \
+                    isinstance(n.func, ast.Attribute) and not name.startswith("torch.cuda"):
+                rep.add(S, "WARN", line, "graph.h2d",
+                        f"{name}() {ctx}: host-to-device copy; fails under capture from pageable memory and freezes the value into the graph")
+            elif name.startswith("torch.cuda.") and last in ("empty_cache", "set_device", "memory_allocated", "reset_peak_memory_stats",
+                                                               "max_memory_allocated", "ipc_collect"):
+                rep.add(S, "WARN", line, "graph.misc", f"{name}() {ctx}")
+            elif last in ("CUDAGraph", "graph", "Event", "elapsed_time", "do_bench") and ("cuda" in name or "triton" in name):
+                rep.add(S, "WARN", line, "leftover.timing", f"{name}() {ctx}: timing/graph code in the timed path")
+            elif name in ("time.time", "time.perf_counter", "time.sleep", "time.monotonic") and not builder:
+                rep.add(S, "WARN", line, "leftover.timing", f"{name}() {ctx}: has no effect under graph replay; diagnostic leftover?")
+            elif name in ("torch.manual_seed", "torch.randn", "torch.rand", "torch.randint", "torch.randperm"):
+                rep.add(S, "WARN", line, "graph.rng", f"{name}() {ctx}: randomness in the timed path")
+            elif name == "torch.compile":
+                rep.add(S, "WARN", line, "graph.compile", f"torch.compile {ctx}")
+            elif last in ("nonzero_static",):
+                pass
+        elif isinstance(n, ast.Subscript) and isinstance(n.ctx, (ast.Load, ast.Store)):
+            sl = n.slice
+            if isinstance(sl, ast.Compare) or (isinstance(sl, ast.Name) and sl.id in mask_names) or \
+                    (isinstance(sl, ast.UnaryOp) and isinstance(sl.op, ast.Invert)):
+                rep.add(S, "ERROR", line, "graph.value-shape",
+                        f"boolean-mask indexing {ast.unparse(n)[:60]} {ctx}: value-dependent shape (use torch.where)")
+        elif isinstance(n, (ast.If, ast.While, ast.Assert, ast.IfExp)):
+            test = n.test
+            if _mentions_reduction(test, strict=True):
+                rep.add(S, "ERROR", line, "graph.sync",
+                        f"control flow on a tensor value ({ast.unparse(test)[:60]}) {ctx}: host sync, not capturable")
+            elif isinstance(n, ast.Assert):
+                rep.add(S, "WARN", line, "shape.assert",
+                        f"assert {ast.unparse(test)[:70]} {ctx}: a nearby or test shape that fails it crashes the run")
+        elif isinstance(n, ast.Global):
+            rep.add(S, "INFO", line, "graph.state", f"global {', '.join(n.names)} {ctx}: module state mutated from the timed path")
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name) and t.value.id in mod.consts:
+                    src = ast.unparse(n.value)
+                    uses_data = any(re.search(rf"\b{re.escape(p)}\[(?!['\"]config)", src) for p in kernel_params) if kernel_params else False
+                    if uses_data:
+                        rep.add(S, "WARN", line, "fresh-inputs",
+                                f"caches into module-level {t.value.id} from the inputs {ctx}: every call gets fresh inputs")
+                    else:
+                        rep.add(S, "INFO", line, "graph.state",
+                                f"fills module-level cache {t.value.id} {ctx}; fine if keyed on shapes/config and filled before capture")
+
+
+def _mentions_reduction(node, strict=False):
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            if n.func.attr in (("any", "all", "item") if strict else REDUCERS):
+                base = dotted(n.func.value) or ""
+                if base.split(".")[0] in ("np", "numpy", "math", "builtins", "os", "re"):
+                    continue
+                return True
+    return False
+
+
+def _build_sites(mod: Module):
+    """Every load_inline / cpp_extension.load call with statically resolved flags where possible."""
+    out = []
+    for n in ast.walk(mod.tree):
+        if not isinstance(n, ast.Call):
+            continue
+        name = call_name(n)
+        last = name.split(".")[-1]
+        resolved = mod.from_names.get(name, name)
+        if last not in BUILD_FUNCS or ("cpp_extension" not in resolved and "cpp_extension" not in name):
+            if not (last == "load_inline"):
+                continue
+        site = {"line": n.lineno, "call": last, "func": None, "unresolved": []}
+        if n.args:
+            try:
+                site["name"] = mod.try_eval(n.args[0])
+            except Exception:
+                pass
+        top = mod.top_function_of(n)
+        site["func"] = top.name if top else None
+        for kw in n.keywords:
+            key = {"extra_cuda_cflags": "cuda_flags", "extra_cflags": "cflags", "name": "name", "verbose": "verbose",
+                   "extra_ldflags": "ldflags", "extra_include_paths": "includes"}.get(kw.arg)
+            if not key:
+                continue
+            try:
+                site[key] = mod.try_eval(kw.value)
+            except Exception:
+                site["unresolved"].append(f"{kw.arg}={ast.unparse(kw.value)[:80]}")
+        t = swallowing_try(mod, n)
+        if t is None and top is not None:  # one or two call levels up
+            frontier = [top.name]
+            for _ in range(3):
+                nxt = []
+                for callee in frontier:
+                    for f in mod.funcs.values():
+                        for c in ast.walk(f):
+                            if isinstance(c, ast.Call) and call_name(c) == callee:
+                                tt = swallowing_try(mod, c)
+                                if tt is not None:
+                                    t = t or tt
+                                nxt.append(f.name)
+                    for c in ast.walk(mod.tree):  # module level
+                        if isinstance(c, ast.Call) and call_name(c) == callee and mod.top_function_of(c) is None:
+                            tt = swallowing_try(mod, c)
+                            if tt is not None:
+                                t = t or tt
+                if t is not None:
+                    break
+                frontier = nxt
+        site["swallowed"] = t.lineno if t is not None else None
+        out.append(site)
+    return out
+
+
+def _check_imports(mod: Module, rep: Report, scout: Path):
+    cache: dict[Path, set | None] = {}
+
+    def defined(path: Path):
+        if path not in cache:
+            try:
+                tree = ast.parse(path.read_text())
+            except Exception:
+                cache[path] = None
+                return None
+            names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, ast.Assign):
+                    for t in node.targets:
+                        for e in ast.walk(t):
+                            if isinstance(e, ast.Name):
+                                names.add(e.id)
+                elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and isinstance(node.target, ast.Name):
+                    names.add(node.target.id)
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    for a in node.names:
+                        if a.name == "*":
+                            names.add("*")
+                        names.add(a.asname or a.name.split(".")[0])
+            cache[path] = names
+        return cache[path]
+
+    def locate(modname):
+        top = modname.split(".")[0]
+        if top not in SCOUT_ROOTS:
+            return None, None
+        root, sev = SCOUT_ROOTS[top]
+        base = scout / root
+        if not (base / top).is_dir():
+            return None, None
+        p = base.joinpath(*modname.split("."))
+        for cand in (p.with_suffix(".py"), p / "__init__.py"):
+            if cand.is_file():
+                return cand, sev
+        if p.is_dir():
+            return p, sev  # namespace package
+        return False, sev
+
+    seen = set()
+    for node in ast.walk(mod.tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            path, sev = locate(node.module)
+            if path is None:
+                continue
+            if path is False:
+                key = (node.module, None)
+                if key not in seen:
+                    seen.add(key)
+                    rep.add("lint", sev, node.lineno, "imports.resolve", f"module {node.module} not found in the image's source")
+                continue
+            for a in node.names:
+                if path.is_dir():
+                    if not (path / f"{a.name}.py").exists() and not (path / a.name).is_dir():
+                        rep.add("lint", sev, node.lineno, "imports.resolve", f"{node.module}.{a.name} not found in the image's source")
+                    continue
+                names = defined(path)
+                if names is None or "*" in names or "__getattr__" in names:
+                    continue
+                if a.name not in names and not (path.parent / f"{a.name}.py").exists() and not (path.parent / a.name).is_dir():
+                    rep.add("lint", sev, node.lineno, "imports.resolve",
+                            f"{a.name} is not defined in {node.module} ({path.relative_to(scout)})")
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                path, sev = locate(a.name)
+                if path is False:
+                    rep.add("lint", sev, node.lineno, "imports.resolve", f"module {a.name} not found in the image's source")
+
+
+# =========================================================================================
+# Stage 2-4: inside the Docker image (python /tools/precheck --in-container /stage)
+# =========================================================================================
+
+STUB_PACKAGES = ("sglang", "sgl_kernel", "flashinfer", "deep_gemm", "quack", "cutlass", "tilelang", "tvm", "tvm_ffi",
+                 "flash_attn", "flash_attn_interface", "hpc", "humming", "deep_ep", "flash_mla", "cuda", "cupy", "einops")
+# Stubbed libraries the judge image has (its startup probe prints their versions): a trace that stops only at
+# calls into these is PASS-STUBBED rather than PARTIAL. Other STUB_PACKAGES may be missing on the judge too.
+JUDGE_LIBRARIES = ("sglang", "sgl_kernel", "flashinfer", "deep_gemm", "tilelang", "cutlass")
+H200 = dict(name="NVIDIA H200", major=9, minor=0, multi_processor_count=132, total_memory=150_754_820_096,
+            L2_cache_size=52_428_800, max_threads_per_multi_processor=2048, warp_size=32, regs_per_multiprocessor=65536,
+            shared_memory_per_block=49152, shared_memory_per_block_optin=232448, shared_memory_per_multiprocessor=233472,
+            is_integrated=False, is_multi_gpu_board=False, uuid="GPU-precheck", gcnArchName="", clock_rate=1980000,
+            memory_clock_rate=3201000, memory_bus_width=6144, pci_bus_id=0, pci_device_id=0, pci_domain_id=0)
+
+
+class HostSync(RuntimeError):
+    """Raised inside a traced kernel_fn at a host synchronization."""
+
+
+class EmulationLimit(RuntimeError):
+    """The emulated GPU cannot follow this path (stubbed library result, unsupported meta op)."""
+
+
+class Trace:
+    """Global trace state shared by the emulation hooks."""
+    in_kernel = False
+    case = None
+    events: list = []
+    hazards: list = []
+    stub_calls: list = []
+    sub_file = None
+    compared: list = []  # submission lines whose tensor-value comparison outside kernel_fn was assumed to hold
+
+    @classmethod
+    def site(cls):
+        """Innermost submission line on the current stack."""
+        import traceback as tb
+        for fr in reversed(tb.extract_stack()):
+            if fr.filename == cls.sub_file:
+                return fr.lineno
+        return 0
+
+    @classmethod
+    def hazard(cls, kind, what):
+        line = cls.site()
+        cls.hazards.append({"kind": kind, "what": what, "line": line, "case": cls.case})
+        return line
+
+
+class Stub:
+    """Stand-in for anything from a library the image has but this container doesn't (sglang, ...)."""
+
+    def __init__(self, name):
+        object.__setattr__(self, "_name", name)
+
+    def __getattr__(self, attr):
+        if attr.startswith("__") and attr.endswith("__"):
+            raise AttributeError(attr)
+        return Stub(f"{self._name}.{attr}")
+
+    def __setattr__(self, k, v):
+        pass
+
+    def __call__(self, *a, **k):
+        if Trace.in_kernel and "()" not in self._name:
+            Trace.events.append(("lib", self._name))
+        Trace.stub_calls.append(self._name)
+        return Stub(f"{self._name}()")
+
+    def __getitem__(self, k):
+        return Stub(f"{self._name}[]")
+
+    def __setitem__(self, k, v):
+        pass
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+    def __bool__(self):
+        return True
+
+    def __int__(self):
+        return 1
+
+    __index__ = __int__
+
+    def __float__(self):
+        return 1.0
+
+    def __repr__(self):
+        return f"<stub {self._name}>"
+
+    def __mro_entries__(self, bases):
+        return (object,)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def _op(self, *a):
+        return self
+
+    __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = __truediv__ = __rtruediv__ = _op
+    __floordiv__ = __rfloordiv__ = __mod__ = __neg__ = __and__ = __or__ = __lt__ = __gt__ = __le__ = __ge__ = _op
+
+
+def install_stub_importer(log, values=None):
+    """Stub every STUB_PACKAGES library the image lacks; `values` gives real attributes to named stub modules."""
+    import importlib.abc
+    import importlib.machinery
+    import importlib.util
+    import types
+
+    missing = set()
+    for top in STUB_PACKAGES:
+        try:
+            if importlib.util.find_spec(top) is None:
+                missing.add(top)
+        except Exception:
+            missing.add(top)
+
+    class StubModule(types.ModuleType):
+        def __getattr__(self, attr):
+            if attr.startswith("__") and attr.endswith("__"):
+                raise AttributeError(attr)
+            return Stub(f"{self.__name__}.{attr}")
+
+    class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname.split(".")[0] in missing:
+                return importlib.machinery.ModuleSpec(fullname, self, is_package=True)
+            return None
+
+        def create_module(self, spec):
+            m = StubModule(spec.name)
+            m.__path__ = []
+            log.append(spec.name)
+            return m
+
+        def exec_module(self, module):
+            module.__dict__.update((values or {}).get(module.__name__, {}))
+
+    sys.meta_path.append(Finder())
+    return missing
+
+
+def install_gpu_emulation(torch, out):
+    """Make torch believe one H200 exists: 'cuda' tensors become meta tensors and the CUDA
+    runtime calls (streams, events, graphs, properties) become no-ops."""
+    import contextlib
+    import types
+    from torch.overrides import TorchFunctionMode
+
+    props = types.SimpleNamespace(**H200)
+    cuda = torch.cuda
+
+    class FakeStream:
+        cuda_stream = 0
+        device = torch.device("meta")
+
+        def __init__(self, *a, **k):
+            pass
+
+        def wait_stream(self, *a):
+            pass
+
+        def wait_event(self, *a):
+            pass
+
+        def record_event(self, e=None):
+            return e or FakeEvent()
+
+        def synchronize(self):
+            host_sync("Stream.synchronize()")
+
+        def query(self):
+            return True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class FakeEvent:
+        def __init__(self, *a, **k):
+            pass
+
+        def record(self, *a):
+            pass
+
+        def wait(self, *a):
+            pass
+
+        def query(self):
+            return True
+
+        def synchronize(self):
+            host_sync("Event.synchronize()")
+
+        def elapsed_time(self, other):
+            if Trace.in_kernel:
+                Trace.hazard("timing", "Event.elapsed_time() in kernel_fn")
+            return 0.01
+
+    class FakeGraph:
+        def __init__(self, *a, **k):
+            pass
+
+        def capture_begin(self, *a, **k):
+            pass
+
+        def capture_end(self):
+            pass
+
+        def replay(self):
+            pass
+
+        def reset(self):
+            pass
+
+        def pool(self):
+            return (0, 0)
+
+        def enable_debug_mode(self):
+            pass
+
+    def host_sync(what):
+        if Trace.in_kernel:
+            Trace.hazard("sync", what)
+            raise HostSync(what)
+
+    @contextlib.contextmanager
+    def fake_graph(*a, **k):
+        yield
+
+    @contextlib.contextmanager
+    def fake_stream_ctx(*a, **k):
+        yield
+
+    patches = {
+        "is_available": lambda: True, "device_count": lambda: 1, "current_device": lambda: 0,
+        "get_device_capability": lambda *a: (9, 0), "get_device_properties": lambda *a: props,
+        "get_device_name": lambda *a: props.name, "synchronize": lambda *a: host_sync("torch.cuda.synchronize()"),
+        "Stream": FakeStream, "ExternalStream": FakeStream, "current_stream": lambda *a: FakeStream(),
+        "default_stream": lambda *a: FakeStream(), "stream": fake_stream_ctx, "Event": FakeEvent,
+        "CUDAGraph": FakeGraph, "graph": fake_graph, "graph_pool_handle": lambda: (0, 0), "set_device": lambda *a: None,
+        "empty_cache": lambda: None, "memory_allocated": lambda *a: 0, "max_memory_allocated": lambda *a: 0,
+        "memory_reserved": lambda *a: 0, "reset_peak_memory_stats": lambda *a: None, "mem_get_info": lambda *a: (140 << 30, 141 << 30),
+        "is_current_stream_capturing": lambda: False, "init": lambda: None, "is_initialized": lambda: True,
+        "manual_seed": lambda *a: None, "manual_seed_all": lambda *a: None, "set_stream": lambda *a: None,
+        "get_arch_list": lambda: ["sm_80", "sm_90", "sm_100", "sm_120"], "ipc_collect": lambda: None,
+        "device": fake_stream_ctx, "_lazy_init": lambda: None,
+    }
+    for k, v in patches.items():
+        setattr(cuda, k, v)
+    torch.cuda.nvtx.range_push = lambda *a, **k: 0
+    torch.cuda.nvtx.range_pop = lambda *a, **k: 0
+    torch.cuda.nvtx.range = fake_stream_ctx
+
+    real_gen = torch.Generator
+
+    class Gen(real_gen):
+        def __new__(cls, device="cpu"):
+            dev = str(device)
+            return real_gen.__new__(cls, device="cpu" if dev.startswith("cuda") or dev == "meta" else device)
+
+    torch.Generator = Gen
+
+    def is_cuda_dev(d):
+        if isinstance(d, torch.device):
+            return d.type == "cuda"
+        if isinstance(d, int) and not isinstance(d, bool):
+            return True
+        return isinstance(d, str) and d.startswith("cuda")
+
+    Tensor = torch.Tensor
+    compare_methods = {torch.equal: "torch.equal", Tensor.equal: "Tensor.equal",
+                       torch.allclose: "torch.allclose", Tensor.allclose: "Tensor.allclose"}
+    sync_methods = {Tensor.item: "Tensor.item()", Tensor.tolist: "Tensor.tolist()", Tensor.cpu: "Tensor.cpu()",
+                    Tensor.numpy: "Tensor.numpy()", Tensor.__bool__: "bool(tensor)", Tensor.__int__: "int(tensor)",
+                    Tensor.__float__: "float(tensor)", Tensor.__index__: "tensor used as an index (int)"}
+    value_shape = {torch.nonzero: "torch.nonzero", Tensor.nonzero: "Tensor.nonzero", torch.masked_select: "masked_select",
+                   Tensor.masked_select: "masked_select", torch.unique: "torch.unique", Tensor.unique: "Tensor.unique",
+                   torch.unique_consecutive: "unique_consecutive", torch.argwhere: "argwhere"}
+    meta = torch.device("meta")
+
+    class MetaCuda(TorchFunctionMode):
+        def __torch_function__(self, func, types_, args=(), kwargs=None):
+            kwargs = dict(kwargs or {})
+            if func in compare_methods and any(isinstance(t, Tensor) and t.device.type == "meta" for t in args[:2]):
+                # Meta tensors have no values. In kernel_fn the comparison is a host sync; elsewhere (prepare's
+                # self-tests) assume it holds, so the trace follows the path a passing self-test takes.
+                if Trace.in_kernel:
+                    Trace.hazard("sync", compare_methods[func] + " in the timed path")
+                    raise HostSync(compare_methods[func])
+                Trace.compared.append(Trace.site())
+                return True
+            if func in sync_methods:
+                t = args[0] if args else None
+                if isinstance(t, Tensor) and t.device.type == "meta":
+                    if Trace.in_kernel:
+                        Trace.hazard("sync", sync_methods[func] + " in the timed path")
+                        raise HostSync(sync_methods[func])
+                    with torch._C.DisableTorchFunction():
+                        if func is Tensor.cpu:
+                            return torch.zeros(t.shape, dtype=t.dtype)
+                        if func is Tensor.tolist:
+                            return torch.zeros(t.shape, dtype=t.dtype).tolist()
+                        if func is Tensor.numpy:
+                            return torch.zeros(t.shape, dtype=t.dtype).numpy()
+                    # Scalar values do not exist on meta tensors. Inventing one can either fail an intact
+                    # canary or silently pass a broken self-test; stop without claiming either result.
+                    raise EmulationLimit(f"{sync_methods[func]} needs tensor values; "
+                                         "meta emulation cannot validate scalar readback")
+            if func in value_shape and Trace.in_kernel:
+                Trace.hazard("value-shape", value_shape[func] + " (output shape depends on values)")
+                raise HostSync(value_shape[func])
+            if func in (Tensor.__getitem__, Tensor.__setitem__) and Trace.in_kernel and len(args) > 1:
+                idx = args[1] if isinstance(args[1], tuple) else (args[1],)
+                if any(isinstance(i, Tensor) and i.dtype == torch.bool for i in idx):
+                    Trace.hazard("value-shape", "boolean-mask indexing (value-dependent shape)")
+                    raise HostSync("boolean mask index")
+            if func is Tensor.cuda:
+                t = args[0]
+                if Trace.in_kernel and t.device.type == "cpu":
+                    Trace.hazard("h2d", "Tensor.cuda() of a host tensor in the timed path")
+                return t.to(meta)
+            if "device" in kwargs and is_cuda_dev(kwargs["device"]):
+                kwargs["device"] = meta
+                if func in (torch.tensor, torch.as_tensor) and Trace.in_kernel:
+                    Trace.hazard("h2d", f"{func.__name__}(..., device='cuda') in the timed path (host-to-device copy)")
+            if func in (Tensor.to,):
+                a = list(args)
+                for i, x in enumerate(a[1:], 1):
+                    if is_cuda_dev(x):
+                        a[i] = meta
+                if Trace.in_kernel and isinstance(a[0], Tensor) and a[0].device.type == "cpu" and \
+                        (meta in a[1:] or kwargs.get("device") == meta):
+                    Trace.hazard("h2d", "Tensor.to('cuda') of a host tensor in the timed path")
+                args = tuple(a)
+            if kwargs.get("pin_memory"):
+                kwargs["pin_memory"] = False
+            if "generator" in kwargs and (kwargs.get("device") == meta or any(
+                    isinstance(x, Tensor) and x.device.type == "meta" for x in args)):
+                kwargs.pop("generator")
+            if func is Tensor.pin_memory:
+                return args[0]
+            if func is Tensor.record_stream:
+                return None
+            try:
+                return func(*args, **kwargs)
+            except NotImplementedError as e:
+                raise EmulationLimit(f"meta tensors cannot run {getattr(func, '__name__', func)}: {str(e)[:200]}") from e
+
+    return MetaCuda
+
+
+def install_triton_emulation(out):
+    """Compile Triton kernels for sm_90a with a fake driver; record launches instead of running."""
+    import triton
+    from triton.backends.compiler import GPUTarget
+    from triton.runtime import driver as driver_mod
+    from triton.runtime.jit import JITFunction
+
+    # Never touch driver_mod.active before set_active: instantiating the real CudaDriver
+    # compiles a helper against libcuda.so.1 and fails without a GPU driver.
+    target = GPUTarget("cuda", 90, 32)
+
+    class FakeUtils:
+        def get_device_properties(self, device):
+            return {"max_shared_mem": H200["shared_memory_per_block_optin"], "multiprocessor_count": 132,
+                    "max_num_regs": 65536, "warpSize": 32, "sm_clock_rate": 1980000, "mem_clock_rate": 3201000,
+                    "mem_bus_width": 6144, "max_threads_per_block": 1024}
+
+        def load_binary(self, name, kernel, shared, device):
+            return (0, 0, 0, 0, 1024)
+
+        def __getattr__(self, k):
+            raise EmulationLimit(f"triton driver utility {k} needs a GPU")
+
+    class FakeLauncher:
+        def __init__(self, src, metadata):
+            self.metadata = metadata
+
+        def __call__(self, *a, **k):
+            return None
+
+    from triton.backends.driver import GPUDriver
+
+    class FakeDriver(GPUDriver):
+        def __init__(self):
+            self.utils = FakeUtils()
+            self.launcher_cls = FakeLauncher
+            self.backend = "cuda"
+
+        @staticmethod
+        def is_active():
+            return True
+
+        def map_python_to_cpp_type(self, ty):
+            from triton.backends.nvidia.driver import ty_to_cpp
+            return ty_to_cpp(ty)
+
+        def get_current_target(self):
+            return target
+
+        def get_active_torch_device(self):
+            import torch
+            return torch.device("meta")
+
+        def get_current_device(self):
+            return 0
+
+        def set_current_device(self, d):
+            pass
+
+        def get_current_stream(self, device=None):
+            return 0
+
+        def get_device_capability(self, device=None):
+            return (9, 0)
+
+        def get_benchmarker(self):
+            return lambda *a, **k: 0.01 if not k.get("quantiles") else [0.01] * len(k["quantiles"])
+
+        def get_device_interface(self):
+            import torch
+            return torch.cuda
+
+        def get_empty_cache_for_benchmark(self):
+            import torch
+            return torch.empty(1, device="meta")
+
+        def clear_cache(self, *a):
+            pass
+
+    fake = FakeDriver()
+    driver_mod.set_active(fake)
+    try:
+        import triton.testing as tt
+        tt.do_bench = lambda *a, **k: 0.01
+        tt.do_bench_cudagraph = lambda *a, **k: 0.01
+    except Exception:
+        pass
+
+    compiled = out["triton_compiled"]
+    real_run = JITFunction.run
+
+    def run(self, *args, grid, warmup, **kwargs):
+        name = getattr(self, "__name__", None) or getattr(self.fn, "__name__", "?")
+        line = Trace.site()
+        if Trace.in_kernel:
+            Trace.events.append(("triton", name))
+        try:
+            kernel = real_run(self, *args, grid=grid, warmup=True, **kwargs)
+        except Exception as e:
+            out["triton_errors"].append({"kernel": name, "line": line, "case": Trace.case,
+                                         "error": f"{type(e).__name__}: {str(e)[:1500]}"})
+            raise
+        if kernel is not None:
+            key = (name, kernel.hash if hasattr(kernel, "hash") else id(kernel))
+            if key not in compiled:
+                md = kernel.metadata
+                compiled[key] = {"kernel": name, "line": line, "obj": kernel,
+                                 "num_warps": getattr(md, "num_warps", None), "num_stages": getattr(md, "num_stages", None),
+                                 "shared": getattr(md, "shared", None), "constexprs": _constexpr_summary(self, args, kwargs),
+                                 "cases": set()}
+            compiled[key]["cases"].add(Trace.case or "import/prepare")
+            try:  # the judge would refuse a launch needing more shared memory than the SM has
+                limit = H200["shared_memory_per_block_optin"]
+                if (kernel.metadata.shared or 0) > limit:
+                    from triton.runtime.errors import OutOfResources
+                    raise OutOfResources(kernel.metadata.shared, limit, "shared memory")
+            except ImportError:
+                pass
+        return kernel
+
+    JITFunction.run = run
+    return triton
+
+
+def _constexpr_summary(jit, args, kwargs):
+    try:
+        names = jit.arg_names
+        cidx = [p.num for p in jit.params if p.is_constexpr]
+        vals = {}
+        for i in cidx:
+            n = names[i]
+            if i < len(args):
+                vals[n] = args[i]
+            elif n in kwargs:
+                vals[n] = kwargs[n]
+        for k in ("num_warps", "num_stages", "num_ctas", "maxnreg"):
+            if k in kwargs:
+                vals[k] = kwargs[k]
+        return {k: (v if isinstance(v, (int, float, bool, str, type(None))) else str(v)) for k, v in vals.items()}
+    except Exception as e:
+        return {"?": str(e)[:100]}
+
+
+def ptxas_usage(ptx: str, workdir: Path, name: str):
+    """Registers / spills / static smem of one Triton kernel, from ptxas -v on its PTX."""
+    import triton.backends.nvidia.compiler as nvc
+    try:
+        ptxas = nvc.get_ptxas(90).path
+    except Exception:
+        ptxas = "/usr/local/cuda/bin/ptxas"
+    f = workdir / f"{name}.ptx"
+    f.write_text(ptx)
+    r = subprocess.run([ptxas, "-v", "--gpu-name", "sm_90a", "-O3", str(f), "-o", str(f.with_suffix(".cubin"))],
+                       capture_output=True, text=True)
+    return parse_ptxas(r.stdout + r.stderr), ptxas_diagnostics(r.stdout + r.stderr)
+
+
+def parse_ptxas(text: str):
+    """{mangled: {regs, spill_st, spill_ld, stack, smem, cmem}} from ptxas -v output."""
+    res, cur = {}, None
+    for line in text.splitlines():
+        m = re.search(r"(?:Compiling entry function|Function properties for) '?([\w$]+)'?", line)
+        if m:
+            cur = m.group(1)
+            res.setdefault(cur, {})
+            continue
+        if cur is None:
+            continue
+        m = re.search(r"(\d+) bytes stack frame, (\d+) bytes spill stores, (\d+) bytes spill loads", line)
+        if m:
+            res[cur].update(stack=int(m.group(1)), spill_st=int(m.group(2)), spill_ld=int(m.group(3)))
+        m = re.search(r"Used (\d+) registers", line)
+        if m:
+            res[cur]["regs"] = int(m.group(1))
+            sm = re.search(r"(\d+) bytes smem", line)
+            res[cur]["smem"] = int(sm.group(1)) if sm else 0
+    return {k: v for k, v in res.items() if "regs" in v}
+
+
+# C7510-C7519 is ptxas's wgmma serialization family ("wgmma.mma_async instructions are serialized due to ...").
+# ptxas prints them as `ptxas info` lines, so a plain warning filter drops them.
+PTXAS_DIAG_RE = re.compile(r"\(?C751\d\)?|spill", re.I)
+
+
+def ptxas_diagnostics(text: str):
+    """[{kernel, code, text}] for ptxas lines about wgmma serialization (C751x) or non-zero spills."""
+    res, cur, seen = [], None, set()
+    for line in text.splitlines():
+        m = re.search(r"(?:Compiling entry function|Function properties for) '?([\w$]+)'?", line)
+        if m:
+            cur = m.group(1)
+        if "ptxas" not in line and not re.search(r"[1-9]\d* bytes spill", line):
+            continue  # "0 bytes spill stores" lines and nvcc/host noise
+        if not PTXAS_DIAG_RE.search(line) or re.search(r"\b0 bytes spill stores, 0 bytes spill loads", line):
+            continue
+        code = re.search(r"C751\d", line)
+        named = re.search(r"function '?([\w$]+)'?", line.split(":", 1)[-1])
+        kernel = named.group(1) if named and named.group(1).startswith("_Z") else cur
+        key = (kernel, line.strip())
+        if key not in seen:
+            seen.add(key)
+            res.append({"kernel": kernel, "code": code.group(0) if code else "spill", "text": line.strip()[:400]})
+    return res
+
+
+def dump_sass(so_paths, pattern: str, outdir: Path, names: dict):
+    """cuobjdump -sass the built .so files; write each kernel whose mangled or demangled name matches into
+    outdir/<kernel>.sass. Returns [{kernel, mangled, path}]."""
+    rx, written = re.compile(pattern), []
+    outdir.mkdir(exist_ok=True)
+    for so in so_paths:
+        r = subprocess.run(["/usr/local/cuda/bin/cuobjdump", "-sass", str(so)], capture_output=True, text=True)
+        parts = re.split(r"^\s*Function : (\S+)\s*$", r.stdout, flags=re.M)
+        funcs = dict(zip(parts[1::2], parts[2::2]))
+        dem = {**demangle([n for n in funcs if n not in names]), **names}
+        for mangled, body in funcs.items():
+            pretty = re.sub(r"^void ", "", dem.get(mangled, mangled))
+            short = _short_kernel(pretty, 200)  # as the report's ptxas table prints it
+            if not (rx.search(mangled) or rx.search(pretty) or rx.search(short)):
+                continue
+            stem =re.sub(r"_+", "_", re.sub(r"[^\w.-]", "_", short)).strip("_")[:120] or mangled[:120]
+            path = outdir / f"{stem}.sass"
+            i = 2
+            while path.exists():
+                path, i = outdir / f"{stem}_{i}.sass", i + 1
+            path.write_text(f"// {pretty}\n// {mangled}\n// from cuobjdump -sass {so.name}\nFunction : {mangled}\n{body}")
+            written.append({"kernel": short, "mangled": mangled, "path": str(path)})
+    return written
+
+
+def demangle(names):
+    if not names:
+        return {}
+    try:
+        r = subprocess.run(["/usr/local/cuda/bin/cu++filt"], input="\n".join(names), capture_output=True, text=True)
+        out = r.stdout.splitlines()
+        if len(out) == len(names):
+            return dict(zip(names, out))
+    except Exception:
+        pass
+    return {n: n for n in names}
+
+
+def install_build_recorder(torch, out, stub_ext, sass_re=None):
+    """Wrap load_inline / load: really build (flags untouched, plus -Xptxas -v), record the
+    result and the exact nvcc lines, and hand back a module whose functions only record calls."""
+    import hashlib
+    import threading
+    import torch.utils.cpp_extension as ce
+
+    lock = threading.Lock()
+    local = threading.local()
+    real_sub_run = subprocess.run
+
+    def sub_run(*a, **k):
+        r = real_sub_run(*a, **k)
+        if getattr(local, "capture", None) is not None and isinstance(getattr(r, "stdout", None), (bytes, str)):
+            local.capture.append(r.stdout.decode(errors="replace") if isinstance(r.stdout, bytes) else r.stdout)
+        return r
+
+    subprocess.run = sub_run
+    ce.subprocess.run = sub_run
+    real_inline, real_load = ce.load_inline, ce.load
+    done = {}
+
+    def wrap(real, kind):
+        def recorder(*args, **kwargs):
+            line = Trace.site()
+            sig = repr((kind, args, sorted(kwargs.items())))
+            key = hashlib.sha1(sig.encode()).hexdigest()[:12]
+            with lock:  # one nvcc at a time: parallel builds in threads blow the container's memory cap
+                return _build(args, kwargs, key, line)
+
+        def _build(args, kwargs, key, line):
+            if key in done:
+                rec = done[key]
+                rec["calls"].append(line)
+                if rec["ok"]:
+                    return rec["_module"]
+                raise RuntimeError(rec["error"][-2000:])
+            name = kwargs.get("name", args[0] if args else "?")
+            k2 = dict(kwargs)
+            flags = list(k2.get("extra_cuda_cflags") or [])
+            k2["extra_cuda_cflags"] = flags + ["-Xptxas=-v"]
+            k2["verbose"] = False
+            build_dir = k2.get("build_directory") or ce._get_build_directory(name, False)
+            rec = {"name": name, "kind": kind, "line": line, "calls": [line], "in_kernel": Trace.in_kernel,
+                   "flags_cuda": flags, "flags_c": list(k2.get("extra_cflags") or []), "build_dir": str(build_dir)}
+            done[key] = rec
+            out["builds"].append(rec)
+            print(f"[precheck] building {kind} {name!r} (line {line}) ...", file=sys.__stdout__, flush=True)
+            local.capture = []
+            t0 = time.time()
+            try:
+                module = real(*args, **k2)
+                rec["ok"] = True
+            except BaseException as e:
+                rec["ok"] = False
+                rec["error"] = "\n".join(local.capture)[-6000:] + f"\n{type(e).__name__}: {str(e)[-3000:]}"
+                raise
+            finally:
+                rec["seconds"] = round(time.time() - t0, 1)
+                log = "\n".join(local.capture)
+                local.capture = None
+                rec["ptxas"] = parse_ptxas(log)
+                rec["ptxas_diag"] = ptxas_diagnostics(log)
+                rec["ptxas_names"] = demangle(sorted(set(rec["ptxas"]) | {d["kernel"] for d in rec["ptxas_diag"] if d["kernel"]}))
+                if sass_re and rec.get("ok"):
+                    try:
+                        sos = sorted(Path(build_dir).glob("*.so"), key=lambda p: p.stat().st_mtime)[-1:]
+                        rec["sass"] = dump_sass(sos, sass_re, Path(out["stage"]) / "sass", rec["ptxas_names"])
+                    except Exception as e:  # noqa: BLE001
+                        rec["sass_error"] = f"{type(e).__name__}: {str(e)[:300]}"
+                rec["warnings"] = sorted({l.strip()[:300] for l in log.splitlines()
+                                          if re.search(r"warning", l, re.I) and "ptxas info" not in l})[:30]
+                try:
+                    ninja = Path(build_dir, "build.ninja").read_text()
+                    rec["ninja_cuda_flags"] = (re.search(r"^cuda_cflags = (.*)$", ninja, re.M) or [None, ""])[1]
+                    rec["ninja_post_cflags"] = (re.search(r"^cuda_post_cflags = (.*)$", ninja, re.M) or [None, ""])[1]
+                    rec["ninja_cflags"] = (re.search(r"^cflags = (.*)$", ninja, re.M) or [None, ""])[1]
+                except OSError:
+                    pass
+                print(f"[precheck]   {'ok' if rec.get('ok') else 'FAILED'} in {rec['seconds']} s", file=sys.__stdout__, flush=True)
+            rec["_module"] = stub_ext(module, name)
+            return rec["_module"]
+        return recorder
+
+    ce.load_inline = wrap(real_inline, "load_inline")
+    ce.load = wrap(real_load, "load")
+
+
+def make_ext_stub(out):
+    def stub_ext(module, ext_name):
+        class Ext:
+            def __getattr__(self, attr):
+                fn = getattr(module, attr)  # AttributeError exactly as the real module
+                doc = (getattr(fn, "__doc__", "") or "").splitlines()
+                sig = doc[0] if doc else ""
+                m = re.match(r"\w+\((.*)\)\s*->\s*(.*)$", sig)
+                params = []
+                if m and m.group(1).strip():
+                    depth, cur = 0, ""
+                    for ch in m.group(1):
+                        depth += ch in "[("
+                        depth -= ch in "])"
+                        if ch == "," and depth == 0:
+                            params.append(cur.strip())
+                            cur = ""
+                        else:
+                            cur += ch
+                    params.append(cur.strip())
+                returns_none = bool(m) and m.group(2).strip() == "None"
+
+                def call(*args, **kwargs):
+                    import torch
+                    if Trace.in_kernel:
+                        Trace.events.append(("ext", f"{ext_name}.{attr}"))
+                    if m and not kwargs:
+                        if len(args) != len(params):
+                            out["ext_errors"].append({"what": f"{ext_name}.{attr}", "line": Trace.site(), "case": Trace.case,
+                                                      "error": f"called with {len(args)} args, the binding takes {len(params)}: {sig}"})
+                            raise TypeError(f"{attr}(): incompatible function arguments ({len(args)} given, {len(params)} expected)")
+                        for i, (a, p) in enumerate(zip(args, params)):
+                            want_t = "Tensor" in p and "Optional" not in p and "None" not in p
+                            # Sequence[Tensor] / List[Tensor] bindings take a list or tuple of tensors
+                            seq = want_t and re.search(r"(Sequence|List|list)\[", p) is not None
+                            if seq and isinstance(a, (list, tuple)) and all(isinstance(e, (torch.Tensor, Stub)) for e in a):
+                                continue
+                            if want_t and not isinstance(a, torch.Tensor) and not isinstance(a, Stub):
+                                out["ext_errors"].append({"what": f"{ext_name}.{attr}", "line": Trace.site(), "case": Trace.case,
+                                                          "error": f"arg {i} is {type(a).__name__}, the binding wants {p}"})
+                                raise TypeError(f"{attr}(): incompatible function arguments (arg {i})")
+                    return None if returns_none else Stub(f"{ext_name}.{attr}()")
+                return call
+        return Ext()
+    return stub_ext
+
+
+def _alarm(seconds):
+    import signal
+
+    def handler(*a):
+        raise TimeoutError(f"precheck: no result after {seconds} s")
+    signal.signal(signal.SIGALRM, handler)
+    signal.alarm(seconds)
+
+
+def _cancel_alarm():
+    import signal
+    signal.alarm(0)
+
+
+def _to_meta(x, torch):
+    if isinstance(x, torch.Tensor):
+        return x.to("meta")
+    if isinstance(x, dict):
+        return {k: _to_meta(v, torch) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return type(x)(_to_meta(v, torch) for v in x)
+    return x
+
+
+def _describe(x, torch):
+    if isinstance(x, torch.Tensor):
+        return f"{str(x.dtype).replace('torch.', '')}{list(x.shape)}"
+    if isinstance(x, (tuple, list)):
+        return "(" + ", ".join(_describe(v, torch) for v in x) + ")"
+    if isinstance(x, dict):
+        return "{" + ", ".join(f"{k}: {_describe(v, torch)}" for k, v in x.items()) + "}"
+    return type(x).__name__ if not isinstance(x, Stub) else repr(x)
+
+
+def _exc_record(e, sub_file):
+    import traceback as tb
+    frames = [f for f in tb.extract_tb(e.__traceback__) if f.filename == sub_file]
+    line = frames[-1].lineno if frames else 0
+    src = frames[-1].line if frames else ""
+    text = f"{type(e).__name__}: {str(e)[:600]}"
+    # Our meta/driver hooks raise EmulationLimit. Other exceptions need an actual
+    # stub value at the failure site; words such as NoneType, metadata or stub in
+    # an ordinary Python error do not identify an emulation limitation.
+    stub = (_stub_library(e, sub_file, src or "")
+            if isinstance(e, (EmulationLimit, TypeError, ValueError, AttributeError, IndexError)) else None)
+    emu = isinstance(e, EmulationLimit) or stub is not None
+    sync = isinstance(e, HostSync)
+    if re.search(r"item\(\) cannot be called on meta|Cannot copy out of meta|data-dependent|nonzero.*meta", str(e)):
+        sync, emu, stub = True, False, None
+        if Trace.in_kernel:
+            Trace.hazards.append({"kind": "sync", "what": f"host sync ({str(e)[:80]})", "line": line, "case": Trace.case})
+    return {"line": line, "src": (src or "")[:160], "error": text, "emulation": bool(emu), "stub": stub,
+            "host_sync": sync, "tail": "".join(tb.format_exception(e))[-2500:]}
+
+
+def _stub_library(e, sub_file, src_line):
+    """The stubbed library (top-level package) whose stand-in result stopped the trace, or None when nothing ties
+    the stop to a stub (a meta-tensor op, a Triton driver call, or an ordinary bug such as a None)."""
+    type_error = (isinstance(e, TypeError) and re.search(
+        r"(?:not |got |type.*['\"])Stub\b", str(e)))
+    unpack_error = (isinstance(e, ValueError) and re.fullmatch(
+        r"(?:not enough values to unpack \(expected \d+, got \d+\)|too many values to unpack \(expected \d+\))", str(e)))
+    if not isinstance(e, EmulationLimit) and not type_error and not unpack_error:
+        return None
+    tbk, last = e.__traceback__, None
+    while tbk is not None:
+        if tbk.tb_frame.f_code.co_filename == sub_file:
+            last = tbk.tb_frame
+        tbk = tbk.tb_next
+    if last is None:
+        return None
+    vals = [last.f_locals.get(k, last.f_globals.get(k)) for k in re.findall(r"[A-Za-z_]\w*", src_line)]
+    vals += [v for d in list(vals) if isinstance(d, dict) for v in list(d.values())[:200]]
+    for v in vals:
+        if isinstance(v, Stub):
+            return v._name.split(".")[0]
+    return None
+
+
+def container_main(stage: Path):
+    """Runs every container stage; whatever crashes is reported as skipped with its reason."""
+    try:
+        return _container_main(stage)
+    except BaseException as e:  # noqa: BLE001
+        import traceback
+        res = stage / "result.json"
+        partial = json.loads(res.read_text()) if res.is_file() else {}
+        partial["fatal"] = f"{type(e).__name__}: {str(e)[:600]}"
+        partial["fatal_tail"] = traceback.format_exc()[-3000:]
+        res.write_text(json.dumps(partial, default=str))
+        print(f"[precheck] container stage crashed: {partial['fatal']}", flush=True)
+        return 0
+
+
+def _container_main(stage: Path):
+    import io
+    import importlib.util
+    import traceback
+
+    cfg = json.loads((stage / "config.json").read_text())
+    out = {"builds": [], "triton": [], "triton_errors": [], "triton_compiled": {}, "ext_errors": [], "cases": [],
+           "import": {}, "prepare": {}, "stubbed": [], "env": {}, "leftover_builds": [], "unlaunched_triton": []}
+    out["cases_discovered"] = sum(len(cases) for cases in cfg.get("cases", {}).values())
+    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0+PTX")  # what torch derives from one visible H200
+    os.environ["TORCH_EXTENSIONS_DIR"] = "/tmp/torch_extensions"
+    os.environ["TRITON_CACHE_DIR"] = "/tmp/triton_cache"
+    os.environ.setdefault("MAX_JOBS", "8")
+    sys.path.insert(0, str(stage))
+    sub_file = str(stage / "submission.py")
+    Trace.sub_file = sub_file
+
+    values = {}
+    if cfg.get("judge_cutlass"):  # mounted by the host side; see FLASHINFER_WHEEL
+        root = Path(cfg["judge_cutlass"])
+        values["flashinfer.jit.env"] = {"CUTLASS_INCLUDE_DIRS": [root / "include", root / "tools" / "util" / "include"]}
+    out["stubbed_packages"] = sorted(install_stub_importer(out["stubbed"], values))
+    import torch
+    import triton
+    out["env"] = {"torch": torch.__version__, "torch_cuda": torch.version.cuda, "triton": triton.__version__,
+                  "nvcc": subprocess.run(["nvcc", "--version"], capture_output=True, text=True).stdout.strip().splitlines()[-1],
+                  "TORCH_CUDA_ARCH_LIST": os.environ["TORCH_CUDA_ARCH_LIST"]}
+    MetaCuda = install_gpu_emulation(torch, out)
+    install_triton_emulation(out)
+    out["stage"] = str(stage)
+    install_build_recorder(torch, out, make_ext_stub(out), cfg.get("sass"))
+    mode = MetaCuda()
+    mode.__enter__()
+    printed = io.StringIO()
+
+    class Tee(io.TextIOBase):
+        def write(self, s):
+            printed.write(s)
+            return len(s)
+
+        def flush(self):
+            pass
+    real_stdout = sys.stdout
+
+    def finish():
+        mode.__exit__(None, None, None)
+        sys.stdout = real_stdout
+        out["printed_tail"] = printed.getvalue()[-6000:]
+        finalize_triton(out, stage)
+        for b in out["builds"]:
+            b.pop("_module", None)
+        out.pop("triton_compiled", None)
+        (stage / "result.json").write_text(json.dumps(out, default=str))
+
+    # ---- import, as the judge does
+    print("[precheck] importing the submission (emulated H200) ...", flush=True)
+    spec = importlib.util.spec_from_file_location("submission", sub_file)
+    sub = importlib.util.module_from_spec(spec)
+    sys.modules["submission"] = sub
+    sys.stdout = Tee()
+    t0 = time.time()
+    try:
+        _alarm(900)
+        spec.loader.exec_module(sub)
+        out["import"] = {"ok": True}
+    except BaseException as e:  # keep going with whatever was defined
+        out["import"] = {"ok": False, **_exc_record(e, sub_file)}
+        if isinstance(e, KeyboardInterrupt):
+            raise
+        _exec_rest(sub, sub_file)
+    finally:
+        _cancel_alarm()
+        out["import"]["seconds"] = round(time.time() - t0, 1)
+    sys.stdout = real_stdout
+
+    problem = cfg.get("problem")
+    ref = None
+    if cfg.get("has_reference") and not cfg.get("no_trace"):
+        try:
+            mode.__exit__(None, None, None)
+            import reference as ref  # noqa: F401  (the harness's own copy, for inputs only)
+        except BaseException as e:
+            out["notes"] = [f"reference.py import failed: {e}"]
+            ref = None
+        finally:
+            mode.__enter__()
+
+    # ---- prepare(weights)
+    state = weights = None
+    if ref is not None and hasattr(sub, "prepare") and hasattr(ref, "generate_weights"):
+        print("[precheck] prepare(weights) on meta tensors ...", flush=True)
+        try:
+            mode.__exit__(None, None, None)
+            seed = getattr(ref, "WEIGHTS_SEED", 0)
+            weights = _to_meta(ref.generate_weights(seed, device="cpu"), torch)
+        finally:
+            mode.__enter__()
+        sys.stdout = Tee()
+        t0 = time.time()
+        Trace.compared = []
+        try:
+            _alarm(1200)
+            state = sub.prepare(weights)
+            out["prepare"] = {"ok": True}
+        except BaseException as e:
+            out["prepare"] = {"ok": False, **_exc_record(e, sub_file)}
+        finally:
+            _cancel_alarm()
+            out["prepare"]["seconds"] = round(time.time() - t0, 1)
+            out["prepare"]["compared"] = sorted(set(Trace.compared))
+            sys.stdout = real_stdout
+
+    # ---- kernel_fn over scored, test and nearby shapes; not with the state=None a prepare() that stopped at an
+    # emulation limit leaves, which only produces misleading failures
+    if out["prepare"].get("emulation"):
+        print("[precheck] prepare() stopped at an emulation limit: kernel_fn is not traced", flush=True)
+    elif ref is not None and hasattr(sub, "kernel_fn") and hasattr(ref, "generate_input") and not cfg.get("no_trace"):
+        import inspect
+        nargs = len([p for p in inspect.signature(sub.kernel_fn).parameters.values() if p.default is p.empty])
+        for group in ("scored", "tests", "nearby"):
+            cases = cfg["cases"][group]
+            print(f"[precheck] kernel_fn over {len(cases)} {group} shapes ...", flush=True)
+            for case in cases:
+                label = ", ".join(f"{k} {v}" for k, v in case.items() if k != "seed")
+                rec = {"group": group, "case": label}
+                try:
+                    mode.__exit__(None, None, None)
+                    data = _to_meta(ref.generate_input(**case, device="cpu"), torch)
+                except BaseException as e:
+                    rec.update(status="skipped", error=f"generate_input failed: {type(e).__name__}: {str(e)[:200]}")
+                    out["cases"].append(rec)
+                    continue
+                finally:
+                    mode.__enter__()
+                expect = _expected_output(ref, data, weights, torch)
+                Trace.case, Trace.events, Trace.stub_calls, Trace.in_kernel = label, [], [], True
+                sys.stdout = Tee()
+                try:
+                    _alarm(cfg.get("case_timeout", 120))
+                    res = sub.kernel_fn(data, state) if nargs >= 2 else sub.kernel_fn(data)
+                    rec["status"] = "ok"
+                    rec["output"] = _describe(res, torch)
+                    if expect and isinstance(res, torch.Tensor) and rec["output"] != expect:
+                        rec["status"] = "bad-output"
+                        rec["error"] = f"returns {rec['output']}, the reference returns {expect}"
+                    elif expect and not isinstance(res, torch.Tensor) and not isinstance(res, Stub) and "[" in expect:
+                        rec["status"] = "bad-output"
+                        rec["error"] = f"returns {rec['output']}, the reference returns {expect}"
+                except BaseException as e:
+                    r = _exc_record(e, sub_file)
+                    rec.update(status="host-sync" if r["host_sync"] else ("emulation" if r["emulation"] else "raised"), **r)
+                    if isinstance(e, KeyboardInterrupt):
+                        raise
+                finally:
+                    _cancel_alarm()
+                    Trace.in_kernel = False
+                    sys.stdout = real_stdout
+                rec["path"] = _path_summary(Trace.events)
+                out["cases"].append(rec)
+            Trace.case = None
+    out["hazards"] = Trace.hazards
+
+    # ---- build sites the trace never reached
+    reached = {c for b in out["builds"] for c in b["calls"]}
+    try:
+        mod = Module(Path(sub_file))
+        for site in _build_sites(mod):
+            if site["line"] in reached or any(abs(site["line"] - r) <= 3 for r in reached):
+                continue
+            fn = getattr(sub, site["func"], None) if site["func"] else None
+            how = None
+            if callable(fn):
+                import inspect
+                try:
+                    req = [p for p in inspect.signature(fn).parameters.values()
+                           if p.default is p.empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+                except (TypeError, ValueError):
+                    req = ["?"]
+                if not req:
+                    how = f"called {site['func']}()"
+                    sys.stdout = Tee()
+                    try:
+                        _alarm(900)
+                        fn()
+                    except BaseException:
+                        pass
+                    finally:
+                        _cancel_alarm()
+                        sys.stdout = real_stdout
+            if how is None:
+                call = next(n for n in ast.walk(mod.tree) if isinstance(n, ast.Call) and n.lineno == site["line"])
+                try:
+                    expr = ast.Expression(body=call)
+                    ast.fix_missing_locations(expr)
+                    _alarm(900)
+                    eval(compile(expr, sub_file, "eval"), vars(sub), {})
+                    how = "evaluated the call with module globals"
+                except BaseException as e:
+                    how = how or f"could not reproduce: {type(e).__name__}: {str(e)[:160]}"
+                finally:
+                    _cancel_alarm()
+            out["leftover_builds"].append({"line": site["line"], "how": how})
+        launched = {v["kernel"] for v in out["triton_compiled"].values()}
+        out["unlaunched_triton"] = sorted(n for n in mod.triton_kernels if n not in launched)
+        out["triton_lines"] = {n: mod.funcs[n].lineno for n in mod.triton_kernels}
+    except BaseException as e:
+        out["notes"] = out.get("notes", []) + [f"leftover-site pass failed: {e}"]
+    finish()
+    return 0
+
+
+def _exec_rest(sub, sub_file):
+    """After a failed import, run the remaining top-level statements one by one so later
+    stages still see the definitions."""
+    tree = ast.parse(Path(sub_file).read_text())
+    ns = vars(sub)
+    for node in tree.body:
+        name = getattr(node, "name", None)
+        if name and name in ns:
+            continue
+        try:
+            code = compile(ast.Module(body=[node], type_ignores=[]), sub_file, "exec")
+            exec(code, ns)
+        except BaseException:
+            pass
+
+
+def _expected_output(ref, data, weights, torch):
+    """Shape/dtype of the reference output, run on meta tensors (None if it can't run there)."""
+    fn = getattr(ref, "ref_kernel", None)
+    if fn is None:
+        return None
+    try:
+        import inspect
+        n = len(inspect.signature(fn).parameters)
+        if n >= 2 and weights is None:
+            return None
+        _alarm(60)
+        res = fn(data) if n == 1 else fn(data, weights)
+        return _describe(res, torch)
+    except BaseException:
+        return None
+    finally:
+        _cancel_alarm()
+
+
+def _path_summary(events):
+    seen, out = set(), []
+    for kind, name in events:
+        if (kind, name) not in seen:
+            seen.add((kind, name))
+            out.append(f"{kind}:{name}")
+    return out
+
+
+def finalize_triton(out, stage):
+    work = stage / "triton_ptx"
+    work.mkdir(exist_ok=True)
+    rows = []
+    for (name, h), v in out.get("triton_compiled", {}).items():
+        k = v.pop("obj", None)
+        row = {kk: (sorted(vv) if isinstance(vv, set) else vv) for kk, vv in v.items()}
+        try:
+            ptx = k.asm.get("ptx") if k is not None else None
+            if ptx:
+                usage, row["ptxas_diag"] = ptxas_usage(ptx, work, f"{name}_{str(h)[:8]}")
+                if usage:
+                    u = next(iter(usage.values()))
+                    row.update(regs=u.get("regs"), spill_st=u.get("spill_st"), spill_ld=u.get("spill_ld"),
+                               stack=u.get("stack"), static_smem=u.get("smem"))
+        except Exception as e:
+            row["usage_error"] = str(e)[:200]
+        rows.append(row)
+    out["triton"] = rows
+
+
+# =========================================================================================
+# Host driver and report
+# =========================================================================================
+
+def find_problem_dir(sub: Path, problem: str) -> Path | None:
+    for d in (sub.parent, ROOT / "problems" / problem):
+        if (d / "reference.py").is_file():
+            return d
+    return None
+
+
+def parse_cases(problem: str, problem_dir: Path | None):
+    """Scored shapes, the judge's pre-timing tests, and nearby shapes, as generate_input kwargs."""
+    spec = TOOLS_DIR / "okc-docs" / f"{problem}.json"
+    scored, tests, task_md = [], [], None
+    if spec.is_file():
+        d = json.loads(spec.read_text())
+        scored = [{k: v for k, v in b.items() if k not in ("load", "weight", "repeats")} for b in d.get("benchmarks", [])]
+        task_md = d.get("task_md")
+    if task_md is None and problem_dir and (problem_dir / "TASK.md").is_file():
+        task_md = (problem_dir / "TASK.md").read_text()
+    if task_md:
+        m = re.search(r"must pass these.*?```\n(.*?)```", task_md, re.S)
+        for i, line in enumerate((m.group(1) if m else "").strip().splitlines()):
+            case = {}
+            for part in line.split(","):
+                k, _, v = part.strip().partition(" ")
+                v = v.strip()
+                try:
+                    case[k] = int(v)
+                except ValueError:
+                    try:
+                        case[k] = float(v)
+                    except ValueError:
+                        case[k] = v
+            case["seed"] = 9000 + i
+            tests.append(case)
+    size_key = next((k for k in ("m", "bs", "batch") if scored and k in scored[0]), None)
+    nearby, have = [], {tuple(sorted(c.items())) for c in scored}
+    if size_key:
+        values = sorted({c[size_key] for c in scored})
+        protos = {}
+        for c in scored:
+            protos.setdefault(c[size_key], []).append(c)
+        for v in values:
+            for nv in (v - 1, v + 1):
+                if nv < 1 or nv in values:
+                    continue
+                for c in protos[v]:
+                    n = dict(c, **{size_key: nv, "seed": c.get("seed", 0) + 7000})
+                    key = tuple(sorted((k, x) for k, x in n.items() if k != "seed"))
+                    if key not in have:
+                        have.add(key)
+                        nearby.append(n)
+        if scored and "q_len" in scored[0] and size_key == "batch":  # prefill: perturb the block length too
+            for c in scored:
+                if c.get("q_len", 1) > 8:
+                    nearby.append(dict(c, q_len=c["q_len"] + 1, seed=c.get("seed", 0) + 7100))
+    return {"scored": scored, "tests": tests, "nearby": nearby}
+
+
+def ensure_image(rebuild=False):
+    have = subprocess.run(["docker", "image", "inspect", IMAGE], capture_output=True).returncode == 0
+    if have and not rebuild:
+        return True
+    with docker_lock():
+        print(f"[precheck] building {IMAGE} from {TOOLS_DIR / 'Dockerfile'} (one-time, several GB) ...", file=sys.stderr)
+        r = subprocess.run(["docker", "build", "-t", IMAGE, "-f", str(TOOLS_DIR / "Dockerfile"), str(TOOLS_DIR)])
+    return r.returncode == 0
+
+
+DOCK_LOCK = Path(os.environ.get("OKC_DOCK_LOCK", "/tmp/okc-release-docker.flock"))
+DOCK_LABEL = "okc.dock"
+
+
+def ensure_cutlass_headers() -> Path | None:
+    """The CUTLASS include tree of the judge's flashinfer wheel, extracted once into CUTLASS_CACHE."""
+    if (CUTLASS_CACHE / "include" / "cute" / "tensor.hpp").is_file():
+        return CUTLASS_CACHE
+    import hashlib
+    import tempfile
+    import urllib.request
+    import zipfile
+    url, sha = FLASHINFER_WHEEL
+    print(f"[precheck] fetching CUTLASS headers from {url.rsplit('/', 1)[-1]} into {CUTLASS_CACHE} (one-time) ...",
+          file=sys.stderr, flush=True)
+    prefix = "flashinfer/data/cutlass/"
+    try:
+        CUTLASS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=CUTLASS_CACHE.parent) as tmp:
+            wheel, dest = Path(tmp) / "flashinfer.whl", Path(tmp) / "cutlass"
+            urllib.request.urlretrieve(url, wheel)
+            if hashlib.sha256(wheel.read_bytes()).hexdigest() != sha:
+                raise OSError(f"sha256 of {wheel.name} does not match {sha}")
+            with zipfile.ZipFile(wheel) as z:
+                for name in z.namelist():
+                    rel = name[len(prefix):] if name.startswith(prefix) else ""
+                    if rel.startswith(("include/", "tools/util/include/")) and not rel.endswith("/") \
+                            and ".." not in Path(rel).parts:
+                        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+                        (dest / rel).write_bytes(z.read(name))
+            dest.rename(CUTLASS_CACHE)
+    except OSError as e:
+        if (CUTLASS_CACHE / "include" / "cute" / "tensor.hpp").is_file():  # another precheck fetched it first
+            return CUTLASS_CACHE
+        print(f"[precheck] could not fetch CUTLASS headers: {e}", file=sys.stderr, flush=True)
+        return None
+    return CUTLASS_CACHE
+
+
+@contextlib.contextmanager
+def docker_lock():
+    """tools/dock's two slot locks, so a precheck runs alone and dock runs take turns; see tools/dock for why
+    it is a kernel lock plus a wait for labelled containers a killed holder left running."""
+    import fcntl
+    # both of tools/dock's slots: a 10 GB precheck container and a 6 GB dock one would overfill the VM
+    with open(DOCK_LOCK, "a") as f, open(f"{DOCK_LOCK}.2", "a") as f2:  # closing (or dying) releases the locks
+        for lk in (f, f2):
+            try:
+                fcntl.lockf(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("[precheck] waiting for another agent's container", file=sys.stderr, flush=True)
+                fcntl.lockf(lk, fcntl.LOCK_EX)
+        said = False
+        while ids := subprocess.run(["docker", "ps", "-q", "--filter", f"label={DOCK_LABEL}"],
+                                    capture_output=True, text=True).stdout.split():
+            if not said:
+                print(f"[precheck] waiting for okc container(s) {' '.join(ids)} left by a killed run", file=sys.stderr, flush=True)
+                said = True
+            time.sleep(5)
+        yield
+
+
+def run_container(rep: Report, sub: Path, problem: str | None, args) -> None:
+    import shutil
+    import tempfile
+    if shutil.which("docker") is None or subprocess.run(["docker", "info"], capture_output=True).returncode != 0:
+        for s in ("build", "trace", "triton"):
+            rep.stages[s] = {"status": "SKIP", "why": "docker is not available"}
+        return
+    if not ensure_image(args.rebuild_image):
+        for s in ("build", "trace", "triton"):
+            rep.stages[s] = {"status": "SKIP", "why": "image build failed"}
+        return
+    stage = Path(tempfile.mkdtemp(prefix="okc-precheck-", dir=args.stage_root))
+    try:
+        shutil.copy(sub, stage / "submission.py")
+        pdir = find_problem_dir(sub, problem) if problem else None
+        for f in ("reference.py", "checks.py", "nvfp4.py"):
+            if pdir and (pdir / f).is_file():
+                shutil.copy(pdir / f, stage / f)
+        cases = parse_cases(problem, pdir) if problem else {"scored": [], "tests": [], "nearby": []}
+        if args.no_trace:
+            cases = {"scored": [], "tests": [], "nearby": []}
+        elif args.quick:
+            cases["tests"], cases["nearby"] = [], cases["nearby"][: len(cases["scored"]) // 2]
+        mounts, judge_cutlass = [], None
+        if cutlass := ensure_cutlass_headers():
+            mounts, judge_cutlass = ["-v", f"{cutlass}:{JUDGE_CUTLASS}:ro"], JUDGE_CUTLASS
+        else:
+            rep.details["notes"] = rep.details.get("notes", []) + [
+                "no CUTLASS headers: flashinfer.jit.env.CUTLASS_INCLUDE_DIRS is empty, so CUTLASS/CuTe builds fail here"]
+        cfg = {"problem": problem, "cases": cases, "no_trace": bool(args.no_trace), "has_reference": bool(pdir),
+               "case_timeout": args.case_timeout, "sass": args.sass, "judge_cutlass": judge_cutlass}
+        (stage / "config.json").write_text(json.dumps(cfg))
+        name = f"okc-precheck-{os.getpid()}"
+        cmd = ["docker", "run", "--rm", "--label", DOCK_LABEL, "--name", name, "--network", "none",
+               "--memory", args.memory, "--shm-size", "1g", "-v", f"{stage}:/stage", "-v", f"{TOOLS_DIR}:/tools:ro",
+               *mounts, IMAGE,  # run this same file inside
+               "python", "-u", f"/tools/{Path(__file__).name}", "--in-container", "/stage"]
+        with docker_lock():
+            t0 = time.time()
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                tail = []
+                for line in proc.stdout:
+                    tail.append(line.rstrip())
+                    tail = tail[-200:]
+                    if line.startswith("[precheck]") and not args.json:
+                        print(line.rstrip(), file=sys.stderr, flush=True)
+                proc.wait()
+            except BaseException:  # interrupted: stop the container before giving the lock away
+                subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+                raise
+            rep.details["container_seconds"] = round(time.time() - t0, 1)
+        res_path = stage / "result.json"
+        if not res_path.is_file():
+            why = (f"skipped: the container was killed (exit {proc.returncode}, likely out of memory under "
+                   f"--memory {args.memory}; try a larger --memory or --no-trace)") if proc.returncode in (137, -9) else \
+                f"skipped: the container exited {proc.returncode} without a result (output tail below)"
+            for s in ("build", "trace", "triton"):
+                rep.stages[s] = {"status": "SKIP", "why": why}
+            rep.details["container_tail"] = [l for l in tail if l.strip() and not re.match(
+                r"=+|CUDA Version|Container image|This container|By pulling|https://|A copy of|WARNING: The NVIDIA|   Use the NVIDIA|== CUDA", l)][-40:]
+            return
+        res = json.loads(res_path.read_text())
+        for b in res.get("builds", []):  # sass paths were written inside the container under /stage
+            for s in b.get("sass", []):
+                s["path"] = str(stage / Path(s["path"]).relative_to("/stage"))
+        merge_container_result(rep, res)
+        if args.sass:
+            dumped = [s for b in res.get("builds", []) for s in b.get("sass", [])]
+            for s in dumped:
+                print(f"[precheck] sass {s['kernel'][:70]}: {s['path']}", file=sys.stderr)
+            if not dumped:
+                print(f"[precheck] --sass {args.sass!r}: no built kernel matched", file=sys.stderr)
+    finally:
+        if not args.keep_stage and not args.sass:
+            shutil.rmtree(stage, ignore_errors=True)
+        else:
+            print(f"[precheck] stage kept at {stage}", file=sys.stderr)
+
+
+def _first_errors(text: str, n=4):
+    lines = [l.strip() for l in text.splitlines() if re.search(r"\berror\b|fatal", l, re.I)
+             and not re.search(r"Error building extension|nvcc -|c\+\+ -MMD|^\d+ \|", l.strip())]
+    seen, out = set(), []
+    for l in lines:
+        l = re.sub(r"^/\S+/(\w+\.(?:cu|cpp|cuh|h))", r"\1", l)
+        if l not in seen:
+            seen.add(l)
+            out.append(l[:240])
+    return out[:n] or [text.strip().splitlines()[-1][:240] if text.strip() else "unknown error"]
+
+
+def _short_kernel(name: str, width: int):
+    nm = re.sub(r"^void ", "", name)
+    nm = re.sub(r"\((?:[^()]|\([^()]*\))*\)$", "", nm)  # drop the parameter list
+    nm = re.sub(r"\((?:int|bool|unsigned int|long)\)", "", nm)
+    return nm if len(nm) <= width else nm[:width - 3] + "..."
+
+
+def _ptxas_diag_findings(rep, stage, line, diag, names, usage, where):
+    """One WARN per kernel and diagnostic: wgmma serialization (C751x) and register spills."""
+    done = set()
+    for d in diag:
+        k = d.get("kernel")
+        kname = _short_kernel(names.get(k, k), 90) if k else "?"
+        if d["code"] == "spill":
+            if (k, "spill") in done:
+                continue
+            u = usage.get(k, {})
+            msg = (f"{kname} {where} spills: {u.get('spill_st')} B stores / {u.get('spill_ld')} B loads at {u.get('regs')} regs"
+                   if u.get("spill_st") or u.get("spill_ld") else f"{kname} {where}: {d['text'][:200]}")
+            rep.add(stage, "WARN", line, "ptxas.spill", msg)
+        else:
+            if (k, d["code"]) in done:
+                continue
+            text = re.sub(r"\s+in the function\s+'?[\w$]+'?", "", d["text"].split(":", 1)[-1].strip())
+            rep.add(stage, "WARN", line, "ptxas.serialized", f"{kname} {where}: {text[:260]}")
+        done.add((k, d["code"]))
+
+
+def merge_container_result(rep: Report, res: dict):
+    sections = rep.details.setdefault("sections", [])
+    cases = res.get("cases", [])
+    counts = {"discovered": res.get("cases_discovered", len(cases)),
+              "reached": sum(c["status"] != "skipped" for c in cases),
+              "completed": sum(c["status"] == "ok" for c in cases),
+              "compiled": len(res.get("triton", []))}
+    if res.get("fatal") and not res.get("builds") and not res.get("cases"):
+        for s in ("build", "trace", "triton"):
+            rep.stages[s] = {"status": "SKIP", "why": f"skipped: precheck's container run crashed ({res['fatal'][:200]})"}
+        rep.stages["trace"].update(counts)
+        sections.append("-- container crash (a precheck bug, not a finding)\n" + res.get("fatal_tail", ""))
+        return
+    if res.get("fatal"):
+        sections.append("-- container crash after partial results (a precheck bug, not a finding)\n" + res.get("fatal_tail", "")[-1500:])
+    env = res.get("env", {})
+    rep.details["container_env"] = env
+    sites = {b["line"]: b for b in rep.details.get("build_sites", [])}
+    swallowed = {}
+    for f in rep.findings:
+        if f.rule == "build.swallowed":
+            swallowed[f.line] = True
+
+    # ---------------- build
+    S = "build"
+    builds = res.get("builds", [])
+    lines = [f"-- build (nvcc {env.get('nvcc', '?')}, torch {env.get('torch')}, "
+             f"TORCH_CUDA_ARCH_LIST={env.get('TORCH_CUDA_ARCH_LIST')} as on one H200)"]
+    for b in builds:
+        where = f"line {b['line']}"
+        if b.get("ok"):
+            lines.append(f"  {b['kind']} {b['name']!r} ({where}): built in {b['seconds']} s")
+        else:
+            errs = _first_errors(b.get("error", ""))
+            sw = " The file catches the failure and silently falls back." if any(
+                abs(b["line"] - l) <= 3 for l in swallowed) else ""
+            rep.add(S, "ERROR", b["line"], "build.fail",
+                    f"{b['kind']} {b['name']!r} fails to compile:{sw} " + " | ".join(errs))
+            lines.append(f"  {b['kind']} {b['name']!r} ({where}): FAILED after {b['seconds']} s")
+            for e in errs:
+                lines.append(f"      {e}")
+        raw = re.sub(r"-isystem \S+ ?", "", b.get("ninja_cuda_flags", "") + " " + b.get("ninja_post_cflags", ""))
+        flags = " ".join(x for x in raw.split() if not x.startswith(("-I", "-DTORCH_", "-DPYBIND11", "-D_GLIBCXX", "-D__CUDA_NO")))
+        if flags:
+            lines.append(f"      nvcc flags: {flags[:400]}")
+            stds = re.findall(r"-std=\S+", flags)
+            if len(set(stds)) > 1:
+                lines.append(f"      note: several -std flags {stds}; nvcc uses the last one")
+        if b.get("warnings"):
+            lines.append(f"      {len(b['warnings'])} compiler warning(s), e.g. {b['warnings'][0][:160]}")
+        ptx = b.get("ptxas", {})
+        if ptx:
+            names = b.get("ptxas_names", {})
+            lines.append(f"      {'kernel (template args shortened)':64s} {'regs':>5s} {'spill st/ld':>12s} {'stack':>6s} {'static smem':>11s}")
+            for mangled, u in sorted(ptx.items(), key=lambda kv: (-kv[1].get("spill_st", 0) - kv[1].get("spill_ld", 0), -kv[1].get("regs", 0))):
+                short = _short_kernel(names.get(mangled, mangled), 64)
+                lines.append(f"      {short:64s} {u.get('regs', 0):5d} {u.get('spill_st', 0):5d}/{u.get('spill_ld', 0):<6d} "
+                             f"{u.get('stack', 0):6d} {u.get('smem', 0):11d}")
+        _ptxas_diag_findings(rep, S, b["line"], b.get("ptxas_diag", []), b.get("ptxas_names", {}),
+                             b.get("ptxas", {}), f"in {b['name']!r}")
+        for s in b.get("sass", []):
+            lines.append(f"      sass {s['kernel'][:60]}: {s['path']}")
+        if b.get("sass_error"):
+            lines.append(f"      sass dump failed: {b['sass_error']}")
+        if b.get("ok") and b["seconds"] > 120:
+            rep.add(S, "WARN", b["line"], "build.slow",
+                    f"{b['name']!r} takes {b['seconds']} s to build here; if it builds inside prepare() it eats the 300 s budget")
+        elif b.get("ok"):
+            rep.add(S, "INFO", b["line"], "build.ok", f"{b['name']!r} built in {b['seconds']} s")
+    for lb in res.get("leftover_builds", []):
+        if lb["how"].startswith("could not"):
+            rep.add(S, "WARN", lb["line"], "build.unchecked", f"build call not reached and not reproducible, so not compile-checked: {lb['how']}")
+        else:
+            lines.append(f"  line {lb['line']}: not reached by import/prepare/kernel_fn; {lb['how']}")
+    if not builds and not sites:
+        lines.append("  no load_inline / cpp_extension.load calls")
+    sections.append("\n".join(lines))
+    n_fail = sum(not b.get("ok") for b in builds)
+    rep.stages[S] = {"status": "FAIL" if n_fail else "PASS",
+                     "why": (f"{n_fail} of {len(builds)} extension(s) fail to compile" if n_fail else
+                             f"{len(builds)} extension(s) compile for sm_90a" if builds else "nothing to build")}
+
+    # ---------------- trace
+    S = "trace"
+    imp, prep = res.get("import", {}), res.get("prepare", {})
+    tl = [f"-- trace (emulated H200: meta tensors; stubbed: {', '.join(res.get('stubbed_packages', [])) or 'nothing'})"]
+    tl.append(f"  import: {'ok' if imp.get('ok') else 'RAISED'} ({imp.get('seconds', 0)} s)")
+    if imp and not imp.get("ok"):
+        sev = "WARN" if imp.get("emulation") else "ERROR"
+        rep.add(S, sev, imp.get("line"), "import.raises",
+                f"importing the file raises {imp.get('error')}" + (" (maybe an emulation limit)" if imp.get("emulation") else ""))
+    if prep:
+        tl.append(f"  prepare: {'ok' if prep.get('ok') else 'RAISED'} ({prep.get('seconds', 0)} s on meta tensors; GPU tuning is not reproduced)")
+        if not prep.get("ok"):
+            sev = "WARN" if prep.get("emulation") else "ERROR"
+            rep.add(S, sev, prep.get("line"), "prepare.raises",
+                    f"prepare() raises {prep.get('error')} at `{prep.get('src', '')}`" +
+                    (" (maybe an emulation limit; later cases ran with state=None)" if prep.get("emulation") else ""))
+    cases = res.get("cases", [])
+    seen_h = set()
+    for h in res.get("hazards", []):
+        key = (h["line"], h["what"])
+        if key in seen_h:
+            continue
+        seen_h.add(key)
+        sev = "WARN" if h["kind"] in ("h2d", "timing") else "ERROR"
+        rep.add(S, sev, h["line"], f"graph.{h['kind']}", f"{h['what']} (first seen on {h['case']})")
+    for e in res.get("ext_errors", []):
+        rep.add(S, "ERROR", e["line"], "ext.args", f"{e['what']}: {e['error']} (case {e['case']})")
+    by_status = {}
+    for c in cases:
+        by_status.setdefault(c["status"], []).append(c)
+    emu_lines = {}
+    for c in cases:
+        if c["status"] == "raised":
+            where = {"scored": "a scored shape", "tests": "a judge test shape (the run fails before timing)",
+                     "nearby": "a nearby shape (final review reruns nearby shapes)"}[c["group"]]
+            rep.add(S, "ERROR", c.get("line"), "shape.raises",
+                    f"kernel_fn raises on {where} [{c['case']}]: {c.get('error')} at `{c.get('src', '')}`")
+        elif c["status"] == "bad-output":
+            rep.add(S, "ERROR", 0, "shape.output", f"[{c['case']}] {c.get('error')}")
+        elif c["status"] == "emulation":
+            emu_lines.setdefault((c.get("line"), c.get("error", "")[:120]), []).append(c["case"])
+        elif c["status"] == "skipped":
+            rep.add(S, "INFO", 0, "trace.skipped", f"[{c['case']}] {c.get('error')}")
+    for (line, err), cs in emu_lines.items():
+        rep.add(S, "INFO", line, "trace.emulation",
+                f"trace of {len(cs)} case(s) stopped here (emulation limit, not a finding): {err}")
+    # dedupe repeated shape errors into one finding per (line, error)
+    dedup, merged = {}, []
+    for f in rep.findings:
+        if f.stage == S and f.rule in ("shape.raises",):
+            key = (f.line, f.message.split("]: ", 1)[-1])
+            if key in dedup:
+                dedup[key][0] += 1
+                continue
+            dedup[key] = [1, f]
+        merged.append(f)
+    for n, f in dedup.values():
+        if n > 1:
+            f.message += f" (+{n - 1} more shapes)"
+    rep.findings = merged
+    if cases:
+        tl.append(f"  kernel_fn: {len(cases)} shapes: " + ", ".join(f"{len(v)} {k}" for k, v in sorted(by_status.items())))
+        paths = {}
+        for c in cases:
+            sig = " ".join(c.get("path", [])) or "(torch ops / cuBLAS only: no Triton, extension or library launches)"
+            if c["status"] not in ("ok",):
+                sig += f"  [{c['status']}]"
+            paths.setdefault(sig, []).append(f"{c['group'][0]}:{c['case']}")
+        tl.append("  paths taken (s = scored, t = test, n = nearby):")
+        for sig, cs in paths.items():
+            tl.append(f"    {sig[:220]}")
+            tl.append(f"        {len(cs)} shape(s): " + "; ".join(cs[:6]) + (" ..." if len(cs) > 6 else ""))
+    if res.get("printed_tail"):
+        pr = [l for l in res["printed_tail"].splitlines() if l.strip()][-8:]
+        tl.append("  last lines the submission printed:")
+        tl.extend(f"    | {l[:200]}" for l in pr)
+    tl.append(f"  cases: {counts['discovered']} discovered, {counts['reached']} reached kernel_fn, "
+              f"{counts['completed']} completed; {counts['compiled']} Triton specialization(s) compiled")
+    sections.append("\n".join(tl))
+    rep.stages[S] = {**trace_status(rep, imp, prep, cases), **counts}
+    _finish_triton(rep, res, sections, env)
+
+
+def trace_status(rep: Report, imp: dict, prep: dict, cases: list) -> dict:
+    """The trace verdict. Besides PASS, FAIL, PARTIAL and SKIP:
+      PASS-STUBBED       every shape ran our code to the end or up to a stubbed call into a JUDGE_LIBRARIES
+                         library (which exists only in the judge image); no ERROR. `stubbed` names the libraries.
+      PARTIAL-EMULATION  prepare() hit an emulation limit. `limit` says where:
+                         "prepare-self-test": prepare compared tensor values (torch.equal/allclose), which meta
+                           tensors cannot do; precheck assumed the comparisons hold and traced kernel_fn on the
+                           path that follows, which came out PASS or PASS-STUBBED (`stubbed`);
+                         "prepare": prepare stopped at another emulation limit, so kernel_fn was not traced."""
+    errs = [f for f in rep.findings if f.stage == "trace" and f.severity == "ERROR"]
+    if not cases and not imp:
+        return {"status": "SKIP", "why": "no reference.py/problem to generate inputs"}
+    if errs:
+        return {"status": "FAIL", "why": errs[0].message[:200] if len(errs) == 1 else
+                f"{len(errs)} errors; first: {errs[0].message[:160]}"}
+    if prep.get("emulation"):
+        return {"status": "PARTIAL-EMULATION", "limit": "prepare",
+                "why": f"prepare() stopped at an emulation limit at line {prep.get('line')} "
+                       f"({str(prep.get('error'))[:140]}); kernel_fn was not traced"}
+    if imp.get("emulation"):
+        return {"status": "PARTIAL", "why": "import stopped at an emulation limit; initialization is unchecked"}
+    reached = sum(c["status"] != "skipped" for c in cases)
+    if not reached:
+        return {"status": "PARTIAL", "why": f"0/{len(cases)} discovered shapes reached kernel_fn"}
+    ok = sum(c["status"] == "ok" for c in cases)
+    emu = [c for c in cases if c["status"] == "emulation"]
+    stubs = {c.get("stub") for c in emu}
+    stubbed = sorted(s for s in stubs if s)
+    if emu and all(c["status"] in ("ok", "emulation") for c in cases) and stubs <= set(JUDGE_LIBRARIES):
+        st = {"status": "PASS-STUBBED", "stubbed": stubbed,
+              "why": f"{ok}/{len(cases)} shapes traced to the end, {len(emu)} up to a call into {', '.join(stubbed)} "
+                     "(judge image only, stubbed here); no host syncs or shape failures seen"}
+    elif emu:
+        where = sorted({c.get("line") for c in emu})
+        return {"status": "PARTIAL",
+                "why": f"{len(emu)}/{len(cases)} shapes stopped at an emulation limit (line(s) {', '.join(map(str, where[:4]))}"
+                       f"{'; stubbed: ' + ', '.join(stubbed) if stubbed else ''}); "
+                       "kernel_fn past that point is unchecked"}
+    elif ok != len(cases):
+        return {"status": "PARTIAL", "why": f"{ok}/{len(cases)} shapes traced to the end; remaining shapes are unchecked"}
+    else:
+        st = {"status": "PASS", "why": f"{ok}/{len(cases)} shapes traced to the end, no host syncs or shape failures seen"}
+    if prep.get("compared"):
+        lines = ", ".join(map(str, prep["compared"][:6]))
+        st = {"status": "PARTIAL-EMULATION", "limit": "prepare-self-test", "stubbed": st.get("stubbed", []),
+              "why": f"prepare() compares tensor values at line(s) {lines}, which meta tensors cannot do; assumed they "
+                     f"hold, then kernel_fn {st['status']}: {st['why']}"}
+    return st
+
+
+def _finish_triton(rep, res, sections, env):
+    S = "triton"
+    rows = res.get("triton", [])
+    tt = ["-- triton (compiled for cuda sm_90a by triton " + str(env.get("triton")) + "; regs/spills from ptxas -v on its PTX)"]
+    for e in res.get("triton_errors", []):
+        rep.add(S, "ERROR", e.get("line"), "triton.compile", f"{e['kernel']} fails to compile/launch ({e.get('case')}): {e['error'][:400]}")
+    if rows:
+        groups = {}
+        for r in rows:
+            groups.setdefault(r["kernel"], []).append(r)
+        tt.append(f"  {'kernel':26s} {'specs':>5s} {'regs':>9s} {'max smem':>9s} {'spills':>7s}  traced from")
+        for name, rs in sorted(groups.items()):
+            regs = [r["regs"] for r in rs if r.get("regs") is not None]
+            spills = sum((r.get("spill_st") or 0) + (r.get("spill_ld") or 0) for r in rs)
+            cases = sorted({c for r in rs for c in r.get("cases", [])})
+            reg_s = f"{min(regs)}-{max(regs)}" if regs and min(regs) != max(regs) else (str(regs[0]) if regs else "?")
+            tt.append(f"  {name[:26]:26s} {len(rs):5d} {reg_s:>9s} {max((r.get('shared') or 0) for r in rs):9d} {spills:7d}  "
+                      f"{len(cases)} shape(s)/phase(s): {', '.join(cases[:3])[:70]}")
+        tt.append("  (one row per specialization in --json output: constexprs, warps, stages, regs, spills, smem)")
+        for r in rows:
+            ce = {k: v for k, v in (r.get("constexprs") or {}).items() if k not in ("num_warps", "num_stages")}
+            if r.get("spill_st") or r.get("spill_ld"):
+                rep.add(S, "WARN", r.get("line"), "triton.spill",
+                        f"{r['kernel']} {json.dumps(ce)[:80]} warps={r.get('num_warps')} spills "
+                        f"{r.get('spill_st')}/{r.get('spill_ld')} B ({r.get('regs')} regs)")
+            serial = [d for d in r.get("ptxas_diag", []) if d["code"] != "spill"]
+            _ptxas_diag_findings(rep, S, r.get("line"), serial, {}, {}, f"{json.dumps(ce)[:80]} warps={r.get('num_warps')}")
+    rep.details["triton_specializations"] = rows
+    lines_of = res.get("triton_lines", {})
+    for name in res.get("unlaunched_triton", []):
+        rep.add(S, "WARN", lines_of.get(name, 0), "triton.unchecked",
+                f"@triton.jit {name} was never launched in the trace, so its signature could not be inferred and it was not compiled")
+    sections.append("\n".join(tt))
+    errs = [f for f in rep.findings if f.stage == S and f.severity == "ERROR"]
+    rep.stages[S] = {"status": "FAIL" if errs else ("PASS" if rows or not res.get("unlaunched_triton") else "PASS"),
+                     "why": (errs[0].message[:200] if errs else
+                             (f"{len(rows)} specialization(s) of {len({r['kernel'] for r in rows})} kernel(s) compiled" if rows
+                              else "no Triton launches to compile")
+                             + (f"; {len(res.get('unlaunched_triton', []))} kernel(s) never launched" if res.get("unlaunched_triton") else ""))}
+
+
+
+
+def stage_status(rep: Report, stage: str):
+    errs = [f for f in rep.findings if f.stage == stage and f.severity == "ERROR"]
+    warns = [f for f in rep.findings if f.stage == stage and f.severity == "WARN"]
+    if stage in rep.stages and rep.stages[stage].get("status") == "SKIP":
+        return rep.stages[stage]
+    st = rep.stages.setdefault(stage, {})
+    if errs:
+        st["status"] = "FAIL"
+        st["why"] = errs[0].message if len(errs) == 1 else f"{len(errs)} errors; first: L{errs[0].line} {errs[0].message}"
+    else:
+        st.setdefault("status", "PASS")
+        if not st.get("why"):
+            st["why"] = f"{len(warns)} warning(s)" if warns else "clean"
+    return st
+
+
+def status_label(st: dict) -> str:
+    """PASS-STUBBED -> "PASS (stubbed: sgl_kernel)"; PARTIAL-EMULATION -> "PARTIAL-EMULATION (prepare)"."""
+    if st["status"] == "PASS-STUBBED":
+        return f"PASS (stubbed: {', '.join(st.get('stubbed', []))})"
+    if st["status"] == "PARTIAL-EMULATION":
+        return f"PARTIAL-EMULATION ({st.get('limit')})"
+    return st["status"]
+
+
+def print_report(rep: Report, verbose=False):
+    w = sys.stdout.write
+    w(f"\nprecheck {rep.path}  (problem: {rep.problem or 'unknown'})\n\n")
+    order = {"ERROR": 0, "WARN": 1, "INFO": 2}
+    for stage in ("lint", "build", "trace", "triton"):
+        fs = sorted((f for f in rep.findings if f.stage == stage), key=lambda f: (order[f.severity], f.line))
+        if not verbose:
+            fs = [f for f in fs if f.severity != "INFO"]
+        if not fs:
+            continue
+        w(f"-- {stage} findings\n")
+        for f in fs:
+            loc = f"L{f.line}" if f.line else "  -"
+            w(f"  {f.severity:5s} {loc:>6s}  [{f.rule}] {f.message}\n")
+        w("\n")
+    for section in rep.details.get("sections", []):
+        w(section.rstrip() + "\n\n")
+    if rep.details.get("container_tail"):
+        w("-- container output (tail)\n" + "\n".join(rep.details["container_tail"]) + "\n\n")
+    w("Summary\n")
+    for stage in ("lint", "build", "trace", "triton"):
+        st = stage_status(rep, stage) if stage in rep.stages or stage == "lint" else None
+        if st:
+            w(f"  {stage:7s} {status_label(st):7s} {st.get('why', '')}\n")
+    n_info = sum(f.severity == "INFO" for f in rep.findings)
+    if n_info and not verbose:
+        w(f"  ({n_info} INFO findings hidden; --verbose shows them)\n")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="precheck", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("submission", help="submission .py file (or the stage dir with --in-container)")
+    ap.add_argument("--problem", choices=PROBLEMS, help="defaults to the file's `# okc: problem=` line")
+    ap.add_argument("--scout", type=Path, default=None, help="optional external source tree for import inspection (or OKC_SCOUT)")
+    ap.add_argument("--lint-only", action="store_true", help="stage 1 only (no Docker)")
+    ap.add_argument("--no-trace", action="store_true", help="build stage only in Docker: skip the emulated prepare/kernel_fn trace")
+    ap.add_argument("--quick", action="store_true", help="trace the scored shapes and a few nearby ones only")
+    ap.add_argument("--case-timeout", type=int, default=120, help="seconds per traced kernel_fn call (default 120)")
+    ap.add_argument("--json", action="store_true", help="print the report as JSON")
+    ap.add_argument("--verbose", "-v", action="store_true", help="also show INFO findings")
+    ap.add_argument("--rebuild-image", action="store_true")
+    # 10g: entries now build extensions in parallel inside prepare(); only one container runs at a time (flock).
+    ap.add_argument("--memory", default="10g", help="docker --memory limit for the container (default 10g)")
+    ap.add_argument("--keep-stage", action="store_true", help="keep the staging dir (build logs, result.json)")
+    ap.add_argument("--stage-root", default=None, help="where to create the staging dir (default: system temp)")
+    ap.add_argument("--sass", metavar="REGEX", default=None,
+                    help="after each build, cuobjdump -sass the kernels whose mangled or demangled name matches "
+                         "into <stage>/sass/<kernel>.sass (keeps the stage dir)")
+    ap.add_argument("--in-container", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+    if args.in_container:
+        return container_main(Path(args.submission))
+
+    sub = Path(args.submission).resolve()
+    if not sub.is_file():
+        ap.error(f"{sub} not found")
+    mod = Module(sub)
+    head = re.match(r"#\s*okc:\s*problem=(\S+)", mod.lines[0] if mod.lines else "")
+    problem = args.problem or (head.group(1) if head and head.group(1) in PROBLEMS else None)
+    rep = Report(path=str(sub), problem=problem)
+    scout = args.scout or (Path(os.environ["OKC_SCOUT"]) if os.environ.get("OKC_SCOUT") else None)
+    lint(mod, rep, problem, scout)
+    if not scout or not scout.is_dir():
+        reason = "no --scout or OKC_SCOUT path supplied" if scout is None else "configured scout path is not a directory"
+        rep.add("lint", "INFO", 0, "imports.skipped", f"import inspection skipped: {reason}; lint is not full import validation")
+    if args.lint_only:
+        for s in ("build", "trace", "triton"):
+            rep.stages[s] = {"status": "SKIP", "why": "--lint-only"}
+    else:
+        run_container(rep, sub, problem, args)
+    for s in ("lint", "build", "trace", "triton"):
+        if s in rep.stages or s == "lint":
+            stage_status(rep, s)
+    if args.json:
+        out = asdict(rep)
+        out["details"].pop("sections", None)
+        print(json.dumps(out, indent=1, default=str))
+    else:
+        print_report(rep, args.verbose)
+    return 1 if any(f.severity == "ERROR" for f in rep.findings) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

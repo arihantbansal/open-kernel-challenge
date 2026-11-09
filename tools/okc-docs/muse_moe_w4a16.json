@@ -1,0 +1,49 @@
+{
+  "name": "muse_moe_w4a16",
+  "source_url": "https://openkernelchallenge.dev/problems/muse_moe_w4a16",
+  "observed_date": "2026-11-05",
+  "benchmarks": [
+    {
+      "bs": 1,
+      "sharding": "ep8",
+      "load": "decode 1",
+      "weight": 60,
+      "seed": 401
+    },
+    {
+      "bs": 16,
+      "sharding": "ep8",
+      "load": "decode 16",
+      "weight": 60,
+      "seed": 402
+    },
+    {
+      "bs": 32,
+      "sharding": "ep8",
+      "load": "decode 32",
+      "weight": 60,
+      "seed": 403
+    },
+    {
+      "bs": 8,
+      "sharding": "ep8",
+      "load": "verify 1",
+      "weight": 60,
+      "seed": 404
+    },
+    {
+      "bs": 128,
+      "sharding": "ep8",
+      "load": "verify 16",
+      "weight": 60,
+      "seed": 405
+    },
+    {
+      "bs": 256,
+      "sharding": "ep8",
+      "load": "verify 32",
+      "weight": 60,
+      "seed": 406
+    }
+  ]
+}

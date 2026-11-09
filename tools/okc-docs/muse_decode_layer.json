@@ -1,0 +1,143 @@
+{
+  "name": "muse_decode_layer",
+  "source_url": "https://openkernelchallenge.dev/problems/muse_decode_layer",
+  "observed_date": "2026-11-05",
+  "benchmarks": [
+    {
+      "batch": 1,
+      "ctx": 80000,
+      "layer": "sliding",
+      "page": 1,
+      "dist": "soft",
+      "load": "decode 1",
+      "weight": 46,
+      "repeats": 60,
+      "seed": 801
+    },
+    {
+      "batch": 1,
+      "ctx": 80000,
+      "layer": "full",
+      "page": 1,
+      "dist": "soft",
+      "load": "decode 1",
+      "weight": 16,
+      "repeats": 60,
+      "seed": 802
+    },
+    {
+      "batch": 16,
+      "ctx": 80000,
+      "layer": "sliding",
+      "page": 1,
+      "spread": "agentic",
+      "dist": "soft",
+      "load": "decode 16",
+      "weight": 46,
+      "seed": 803
+    },
+    {
+      "batch": 16,
+      "ctx": 80000,
+      "layer": "full",
+      "page": 1,
+      "spread": "agentic",
+      "dist": "soft",
+      "load": "decode 16",
+      "weight": 16,
+      "seed": 804
+    },
+    {
+      "batch": 32,
+      "ctx": 80000,
+      "layer": "sliding",
+      "page": 1,
+      "spread": "agentic",
+      "dist": "soft",
+      "load": "decode 32",
+      "weight": 46,
+      "seed": 805
+    },
+    {
+      "batch": 32,
+      "ctx": 80000,
+      "layer": "full",
+      "page": 1,
+      "spread": "agentic",
+      "dist": "soft",
+      "load": "decode 32",
+      "weight": 16,
+      "seed": 806
+    },
+    {
+      "batch": 1,
+      "ctx": 80000,
+      "layer": "sliding",
+      "page": 1,
+      "q_len": 8,
+      "dist": "soft",
+      "load": "verify 1",
+      "weight": 46,
+      "seed": 807
+    },
+    {
+      "batch": 1,
+      "ctx": 80000,
+      "layer": "full",
+      "page": 1,
+      "q_len": 8,
+      "dist": "soft",
+      "load": "verify 1",
+      "weight": 16,
+      "seed": 808
+    },
+    {
+      "batch": 16,
+      "ctx": 80000,
+      "layer": "sliding",
+      "page": 1,
+      "q_len": 8,
+      "spread": "agentic",
+      "dist": "soft",
+      "load": "verify 16",
+      "weight": 46,
+      "seed": 809
+    },
+    {
+      "batch": 16,
+      "ctx": 80000,
+      "layer": "full",
+      "page": 1,
+      "q_len": 8,
+      "spread": "agentic",
+      "dist": "soft",
+      "load": "verify 16",
+      "weight": 16,
+      "seed": 810
+    },
+    {
+      "batch": 32,
+      "ctx": 80000,
+      "layer": "sliding",
+      "page": 1,
+      "q_len": 8,
+      "spread": "agentic",
+      "dist": "soft",
+      "load": "verify 32",
+      "weight": 46,
+      "seed": 811
+    },
+    {
+      "batch": 32,
+      "ctx": 80000,
+      "layer": "full",
+      "page": 1,
+      "q_len": 8,
+      "spread": "agentic",
+      "dist": "soft",
+      "load": "verify 32",
+      "weight": 16,
+      "seed": 812
+    }
+  ]
+}

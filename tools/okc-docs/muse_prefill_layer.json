@@ -1,0 +1,103 @@
+{
+  "name": "muse_prefill_layer",
+  "source_url": "https://openkernelchallenge.dev/problems/muse_prefill_layer",
+  "observed_date": "2026-11-05",
+  "benchmarks": [
+    {
+      "batch": 1,
+      "ctx": 80000,
+      "layer": "sliding",
+      "q_len": 753,
+      "page": 1,
+      "dist": "soft",
+      "load": "turn 1",
+      "weight": 46,
+      "repeats": 6,
+      "seed": 1001
+    },
+    {
+      "batch": 1,
+      "ctx": 80000,
+      "layer": "full",
+      "q_len": 753,
+      "page": 1,
+      "dist": "soft",
+      "load": "turn 1",
+      "weight": 16,
+      "repeats": 6,
+      "seed": 1002
+    },
+    {
+      "batch": 4,
+      "ctx": 80000,
+      "layer": "sliding",
+      "q_len": 753,
+      "page": 1,
+      "dist": "soft",
+      "load": "turn 4",
+      "weight": 46,
+      "repeats": 6,
+      "seed": 1003
+    },
+    {
+      "batch": 4,
+      "ctx": 80000,
+      "layer": "full",
+      "q_len": 753,
+      "page": 1,
+      "dist": "soft",
+      "load": "turn 4",
+      "weight": 16,
+      "repeats": 6,
+      "seed": 1004
+    },
+    {
+      "batch": 1,
+      "ctx": 0,
+      "layer": "full",
+      "q_len": 16384,
+      "page": 1,
+      "dist": "soft",
+      "load": "first turn",
+      "weight": 16,
+      "repeats": 6,
+      "seed": 1006
+    },
+    {
+      "batch": 1,
+      "ctx": 32768,
+      "layer": "sliding",
+      "q_len": 16384,
+      "page": 1,
+      "dist": "soft",
+      "load": "first turn",
+      "weight": 138,
+      "repeats": 6,
+      "seed": 1007
+    },
+    {
+      "batch": 1,
+      "ctx": 32768,
+      "layer": "full",
+      "q_len": 16384,
+      "page": 1,
+      "dist": "soft",
+      "load": "first turn",
+      "weight": 16,
+      "repeats": 6,
+      "seed": 1008
+    },
+    {
+      "batch": 1,
+      "ctx": 65536,
+      "layer": "full",
+      "q_len": 16384,
+      "page": 1,
+      "dist": "soft",
+      "load": "first turn",
+      "weight": 16,
+      "repeats": 6,
+      "seed": 1010
+    }
+  ]
+}

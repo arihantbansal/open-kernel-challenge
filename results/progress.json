@@ -1,0 +1,128 @@
+{
+  "schema_version": 1,
+  "hardware": "NVIDIA H200 SXM",
+  "baseline": "Open Kernel Challenge SGLang baseline",
+  "notes": [
+    "Selected scored runs during the challenge.",
+    "Dates come from the local run index; its timezone is unspecified."
+  ],
+  "milestones": [
+    {
+      "problem": "muse_decode_layer",
+      "stage": "earlier",
+      "recorded_at": "2026-11-03 10:26",
+      "job_id": "aae32305902d47a9",
+      "measured_sha256": "7439c304f709d5f2a07af3735dabf6d96e84bbc73c82ee75c78d240cef072731",
+      "mode": "run",
+      "passed": true,
+      "tests_passed": 13,
+      "speedup": 2.171285130358583,
+      "score_us": 10417.931612816003,
+      "set_board_best": true
+    },
+    {
+      "problem": "muse_decode_layer",
+      "stage": "latest",
+      "recorded_at": "2026-11-03 20:26",
+      "job_id": "6d010e3ba74841ac",
+      "measured_sha256": "dbeddb00262a8d4142ffd42afc6002386f725eb75d08f5babb0bfdb0f7d02a47",
+      "mode": "run",
+      "passed": true,
+      "tests_passed": 13,
+      "speedup": 2.231491523403833,
+      "score_us": 10136.852308314328,
+      "set_board_best": true
+    },
+    {
+      "problem": "muse_attention_decode",
+      "stage": "earlier",
+      "recorded_at": "2026-11-03 11:24",
+      "job_id": "06765fc477dd464c",
+      "measured_sha256": "4ec52eb3880a698597e5ea75c14de49fe3367914f2460bbdabf9b61316690899",
+      "mode": "run",
+      "passed": true,
+      "tests_passed": 16,
+      "speedup": 2.115637662480483,
+      "score_us": 1780.2197733539094,
+      "set_board_best": true
+    },
+    {
+      "problem": "muse_attention_decode",
+      "stage": "latest",
+      "recorded_at": "2026-11-04 21:01",
+      "job_id": "300559f5d2484eb4",
+      "measured_sha256": "dd6d0b241f606e0d7fc9dc5d98f28a911934e74a9f25e6c411189883e5275982",
+      "mode": "run",
+      "passed": true,
+      "tests_passed": 16,
+      "speedup": 2.328469763569533,
+      "score_us": 1617.50006760933,
+      "set_board_best": true
+    },
+    {
+      "problem": "muse_moe_w4a16",
+      "stage": "earlier",
+      "recorded_at": "2026-10-27 15:11",
+      "job_id": "7d4ddd45c60a40fa",
+      "measured_sha256": "ece5a51e4ee5e9a15f38658c521cfa87b1f0695a0134c80dc9cd40d3b4f2bfd8",
+      "mode": "run",
+      "passed": true,
+      "tests_passed": 5,
+      "speedup": 2.109802621068095,
+      "score_us": 6374.2929626239875,
+      "set_board_best": true
+    },
+    {
+      "problem": "muse_moe_w4a16",
+      "stage": "latest",
+      "recorded_at": "2026-11-04 20:50",
+      "job_id": "268cf7dfbd7f455e",
+      "measured_sha256": "50b776712e773b6a3c5ae0b6169e4832ac48efbff861edd5ecc419ea0c6c7ff7",
+      "mode": "run",
+      "passed": true,
+      "tests_passed": 5,
+      "speedup": 2.3698075304024546,
+      "score_us": 5674.93343972795,
+      "set_board_best": true
+    },
+    {
+      "problem": "muse_bf16_proj",
+      "stage": "earlier",
+      "recorded_at": "2026-10-27 06:39",
+      "job_id": "4e08de3380504918",
+      "measured_sha256": "1d02a78ea0cb42b77c2ad00ab472d39bef3be74d7162db6975f4edeb71ba178f",
+      "mode": "run",
+      "passed": true,
+      "tests_passed": 9,
+      "speedup": 1.409711944645417,
+      "score_us": 3426.7993673098126,
+      "set_board_best": false
+    },
+    {
+      "problem": "muse_bf16_proj",
+      "stage": "latest",
+      "recorded_at": "2026-11-03 10:57",
+      "job_id": "e085bc90b3e043f1",
+      "measured_sha256": "752ddb2c6f25eafaa2d26d2af6a59b826080b1d1765c5335b457cac061eb03bd",
+      "mode": "run",
+      "passed": true,
+      "tests_passed": 9,
+      "speedup": 1.5179774435943827,
+      "score_us": 3182.392479140707,
+      "set_board_best": true
+    },
+    {
+      "problem": "muse_prefill_layer",
+      "stage": "latest",
+      "recorded_at": "2026-11-04 21:17",
+      "job_id": "4d6d78725b744746",
+      "measured_sha256": "83c608305e0b56e87d761ead4a293fb26611ade390e90a17166410b811492c3a",
+      "mode": "run",
+      "passed": true,
+      "tests_passed": 5,
+      "speedup": 1.9113601397732332,
+      "score_us": 202684.93202226257,
+      "set_board_best": true
+    }
+  ]
+}

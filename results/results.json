@@ -1,0 +1,1163 @@
+{
+  "schema_version": 1,
+  "kind": "official_submission_results",
+  "hardware": "NVIDIA H200 SXM",
+  "baseline": "challenge SGLang baseline",
+  "observed_between": "2026-11-03/2026-11-05",
+  "entries": [
+    {
+      "problem": "muse_decode_layer",
+      "source": "submissions/muse_decode_layer.py",
+      "sha256": "18078cebb017fc4b37fcb182c4b148cc5b8bcbd6e4c523edf7001acc8b1ad652",
+      "job_id": "6d010e3ba74841ac",
+      "mode": "run",
+      "summary": {
+        "status": "ok",
+        "passed": true,
+        "error": null,
+        "speedup": 2.231491523403833,
+        "speedup_ci": [
+          2.1980191505527755,
+          2.26496389625489
+        ],
+        "score_us": 10136.852308314328,
+        "tests": 13,
+        "tests_passed": 13
+      },
+      "benchmarks": [
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "sliding",
+            "load": "decode 1",
+            "page": 1,
+            "repeats": 60,
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 173728.00409793854,
+          "median_ns": 67407.16121259567,
+          "speedup": 2.5772929904289725,
+          "paired_ratio": 2.5772929904289725
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "full",
+            "load": "decode 1",
+            "page": 1,
+            "repeats": 60,
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 184319.99860331416,
+          "median_ns": 75088.18592207604,
+          "speedup": 2.454713698831334,
+          "paired_ratio": 2.454713698831334
+        },
+        {
+          "case": {
+            "batch": 16,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "sliding",
+            "load": "decode 16",
+            "page": 1,
+            "spread": "agentic",
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 267248.0042092502,
+          "median_ns": 126017.54790412431,
+          "speedup": 2.1207205556211566,
+          "paired_ratio": 2.1207205556211566
+        },
+        {
+          "case": {
+            "batch": 16,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "full",
+            "load": "decode 16",
+            "page": 1,
+            "spread": "agentic",
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 442640.0000229478,
+          "median_ns": 207297.90343695408,
+          "speedup": 2.1352844996696687,
+          "paired_ratio": 2.1352844996696687
+        },
+        {
+          "case": {
+            "batch": 32,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "sliding",
+            "load": "decode 32",
+            "page": 1,
+            "spread": "agentic",
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 268112.001940608,
+          "median_ns": 147430.214409964,
+          "speedup": 1.8185688938568605,
+          "paired_ratio": 1.8185688938568605
+        },
+        {
+          "case": {
+            "batch": 32,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "full",
+            "load": "decode 32",
+            "page": 1,
+            "spread": "agentic",
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 623632.0054158568,
+          "median_ns": 300638.1923555606,
+          "speedup": 2.0743605479050244,
+          "paired_ratio": 2.0743605479050244
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "sliding",
+            "load": "verify 1",
+            "page": 1,
+            "q_len": 8,
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 267007.99260288477,
+          "median_ns": 106563.59474825265,
+          "speedup": 2.5056211104145674,
+          "paired_ratio": 2.5056211104145674
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "full",
+            "load": "verify 1",
+            "page": 1,
+            "q_len": 8,
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 267120.0050972402,
+          "median_ns": 109598.28715982407,
+          "speedup": 2.437264413701162,
+          "paired_ratio": 2.437264413701162
+        },
+        {
+          "case": {
+            "batch": 16,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "sliding",
+            "load": "verify 16",
+            "page": 1,
+            "q_len": 8,
+            "spread": "agentic",
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 523152.00911834836,
+          "median_ns": 243351.48343020875,
+          "speedup": 2.1497794126592376,
+          "paired_ratio": 2.1497794126592376
+        },
+        {
+          "case": {
+            "batch": 16,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "full",
+            "load": "verify 16",
+            "page": 1,
+            "q_len": 8,
+            "spread": "agentic",
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 710671.9841249287,
+          "median_ns": 350504.57184213365,
+          "speedup": 2.0275683720468374,
+          "paired_ratio": 2.0275683720468374
+        },
+        {
+          "case": {
+            "batch": 32,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "sliding",
+            "load": "verify 32",
+            "page": 1,
+            "q_len": 8,
+            "spread": "agentic",
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 715984.0217791498,
+          "median_ns": 308777.59333402634,
+          "speedup": 2.318769357738402,
+          "paired_ratio": 2.318769357738402
+        },
+        {
+          "case": {
+            "batch": 32,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "full",
+            "load": "verify 32",
+            "page": 1,
+            "q_len": 8,
+            "spread": "agentic",
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 1084159.994032234,
+          "median_ns": 501789.9735065022,
+          "speedup": 2.1605852075045204,
+          "paired_ratio": 2.1605852075045204
+        }
+      ],
+      "measured_sha256": "dbeddb00262a8d4142ffd42afc6002386f725eb75d08f5babb0bfdb0f7d02a47"
+    },
+    {
+      "problem": "muse_attention_decode",
+      "source": "submissions/muse_attention_decode.py",
+      "sha256": "9c6f1736800fde14e8ce897460c035803e857743513605af5ae546c7cf28ede9",
+      "job_id": "300559f5d2484eb4",
+      "mode": "run",
+      "summary": {
+        "status": "ok",
+        "passed": true,
+        "error": null,
+        "speedup": 2.328469763569533,
+        "speedup_ci": [
+          2.29354271711599,
+          2.3744824844219217
+        ],
+        "score_us": 1617.50006760933,
+        "tests": 16,
+        "tests_passed": 16
+      },
+      "benchmarks": [
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "soft",
+            "heads": "tp8",
+            "layer": "sliding",
+            "load": "decode 1",
+            "page": 1,
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 21120.00063061714,
+          "median_ns": 5842.96251190702,
+          "speedup": 3.614604849436903,
+          "paired_ratio": 3.614604849436903
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "coherent",
+            "heads": "tp8",
+            "layer": "full",
+            "load": "decode 1",
+            "page": 1,
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 31024.000607430935,
+          "median_ns": 11950.511537386654,
+          "speedup": 2.5960395511416983,
+          "paired_ratio": 2.5960395511416983
+        },
+        {
+          "case": {
+            "batch": 16,
+            "ctx": 80000,
+            "dist": "soft",
+            "heads": "tp8",
+            "layer": "sliding",
+            "load": "decode 16",
+            "page": 1,
+            "spread": "agentic",
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 26863.999664783478,
+          "median_ns": 9275.68501998895,
+          "speedup": 2.8961742024327037,
+          "paired_ratio": 2.8961742024327037
+        },
+        {
+          "case": {
+            "batch": 16,
+            "ctx": 80000,
+            "dist": "coherent",
+            "heads": "tp8",
+            "layer": "full",
+            "load": "decode 16",
+            "page": 1,
+            "spread": "agentic",
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 200528.00327539444,
+          "median_ns": 88578.9083934246,
+          "speedup": 2.263834663492873,
+          "paired_ratio": 2.263834663492873
+        },
+        {
+          "case": {
+            "batch": 32,
+            "ctx": 80000,
+            "dist": "soft",
+            "heads": "tp8",
+            "layer": "sliding",
+            "load": "decode 32",
+            "page": 1,
+            "spread": "agentic",
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 31472.000759094954,
+          "median_ns": 11160.29965480683,
+          "speedup": 2.819996033488197,
+          "paired_ratio": 2.819996033488197
+        },
+        {
+          "case": {
+            "batch": 32,
+            "ctx": 80000,
+            "dist": "coherent",
+            "heads": "tp8",
+            "layer": "full",
+            "load": "decode 32",
+            "page": 1,
+            "spread": "agentic",
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 385471.9935916364,
+          "median_ns": 167479.3904464202,
+          "speedup": 2.30160852964745,
+          "paired_ratio": 2.30160852964745
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "soft",
+            "heads": "tp8",
+            "layer": "sliding",
+            "load": "verify 1",
+            "page": 1,
+            "q_len": 8,
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 23439.999669790268,
+          "median_ns": 8029.775105241119,
+          "speedup": 2.9191352637623353,
+          "paired_ratio": 2.9191352637623353
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "coherent",
+            "heads": "tp8",
+            "layer": "full",
+            "load": "verify 1",
+            "page": 1,
+            "q_len": 8,
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 35999.99798461795,
+          "median_ns": 15985.686644664629,
+          "speedup": 2.2520144917661877,
+          "paired_ratio": 2.2520144917661877
+        },
+        {
+          "case": {
+            "batch": 16,
+            "ctx": 80000,
+            "dist": "soft",
+            "heads": "tp8",
+            "layer": "sliding",
+            "load": "verify 16",
+            "page": 1,
+            "q_len": 8,
+            "spread": "agentic",
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 29007.998760789633,
+          "median_ns": 12902.488723434572,
+          "speedup": 2.248248332750169,
+          "paired_ratio": 2.248248332750169
+        },
+        {
+          "case": {
+            "batch": 16,
+            "ctx": 80000,
+            "dist": "coherent",
+            "heads": "tp8",
+            "layer": "full",
+            "load": "verify 16",
+            "page": 1,
+            "q_len": 8,
+            "spread": "agentic",
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 204495.9980994463,
+          "median_ns": 122192.52243136665,
+          "speedup": 1.6735557465417576,
+          "paired_ratio": 1.6735557465417576
+        },
+        {
+          "case": {
+            "batch": 32,
+            "ctx": 80000,
+            "dist": "soft",
+            "heads": "tp8",
+            "layer": "sliding",
+            "load": "verify 32",
+            "page": 1,
+            "q_len": 8,
+            "spread": "agentic",
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 34128.00095975399,
+          "median_ns": 16986.751531817856,
+          "speedup": 2.0090951996224167,
+          "paired_ratio": 2.0090951996224167
+        },
+        {
+          "case": {
+            "batch": 32,
+            "ctx": 80000,
+            "dist": "coherent",
+            "heads": "tp8",
+            "layer": "full",
+            "load": "verify 32",
+            "page": 1,
+            "q_len": 8,
+            "spread": "agentic",
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 388832.0019468665,
+          "median_ns": 219211.32615241493,
+          "speedup": 1.7737769702488657,
+          "paired_ratio": 1.7737769702488657
+        }
+      ],
+      "measured_sha256": "dd6d0b241f606e0d7fc9dc5d98f28a911934e74a9f25e6c411189883e5275982"
+    },
+    {
+      "problem": "muse_moe_w4a16",
+      "source": "submissions/muse_moe_w4a16.py",
+      "sha256": "5da13cb2160c077a77e48c9570d20007e7851ff3c53ecc9725aae0cedf8b2894",
+      "job_id": "268cf7dfbd7f455e",
+      "mode": "run",
+      "summary": {
+        "status": "ok",
+        "passed": true,
+        "error": null,
+        "speedup": 2.3698075304024546,
+        "speedup_ci": [
+          2.334260417446418,
+          2.4053546433584914
+        ],
+        "score_us": 5674.93343972795,
+        "tests": 5,
+        "tests_passed": 5
+      },
+      "benchmarks": [
+        {
+          "case": {
+            "bs": 1,
+            "load": "decode 1",
+            "sharding": "ep8",
+            "weight": 60
+          },
+          "status": "pass",
+          "baseline_ns": 78576.00226998329,
+          "median_ns": 25374.93052575181,
+          "speedup": 3.0965997006470714,
+          "paired_ratio": 3.0965997006470714
+        },
+        {
+          "case": {
+            "bs": 16,
+            "load": "decode 16",
+            "sharding": "ep8",
+            "weight": 60
+          },
+          "status": "pass",
+          "baseline_ns": 188512.00584322214,
+          "median_ns": 92314.80991607044,
+          "speedup": 2.0420559389615924,
+          "paired_ratio": 2.0420559389615924
+        },
+        {
+          "case": {
+            "bs": 32,
+            "load": "decode 32",
+            "sharding": "ep8",
+            "weight": 60
+          },
+          "status": "pass",
+          "baseline_ns": 212816.0009160638,
+          "median_ns": 127753.42257315855,
+          "speedup": 1.665834046788013,
+          "paired_ratio": 1.665834046788013
+        },
+        {
+          "case": {
+            "bs": 8,
+            "load": "verify 1",
+            "sharding": "ep8",
+            "weight": 60
+          },
+          "status": "pass",
+          "baseline_ns": 142351.99941322207,
+          "median_ns": 63770.0362188577,
+          "speedup": 2.232270951276747,
+          "paired_ratio": 2.232270951276747
+        },
+        {
+          "case": {
+            "bs": 128,
+            "load": "verify 16",
+            "sharding": "ep8",
+            "weight": 60
+          },
+          "status": "pass",
+          "baseline_ns": 457616.00974947214,
+          "median_ns": 176432.71672484023,
+          "speedup": 2.593714013162071,
+          "paired_ratio": 2.593714013162071
+        },
+        {
+          "case": {
+            "bs": 256,
+            "load": "verify 32",
+            "sharding": "ep8",
+            "weight": 60
+          },
+          "status": "pass",
+          "baseline_ns": 615855.984389782,
+          "median_ns": 212057.74914251728,
+          "speedup": 2.904189952407185,
+          "paired_ratio": 2.904189952407185
+        }
+      ],
+      "measured_sha256": "50b776712e773b6a3c5ae0b6169e4832ac48efbff861edd5ecc419ea0c6c7ff7"
+    },
+    {
+      "problem": "muse_bf16_proj",
+      "source": "submissions/muse_bf16_proj.py",
+      "sha256": "f99ff24e7bd05dc1718943572bd50714fc0f427711d6849e9ce94a5846a8edad",
+      "job_id": "e085bc90b3e043f1",
+      "mode": "run",
+      "summary": {
+        "status": "ok",
+        "passed": true,
+        "error": null,
+        "speedup": 1.5179774435943827,
+        "speedup_ci": [
+          1.495207781940467,
+          1.5407471052482984
+        ],
+        "score_us": 3182.392479140707,
+        "tests": 9,
+        "tests_passed": 9
+      },
+      "benchmarks": [
+        {
+          "case": {
+            "layer": "qkv_gate",
+            "load": "decode 1",
+            "m": 1,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 13983.998913317919,
+          "median_ns": 8836.39549914545,
+          "speedup": 1.582545610896466,
+          "paired_ratio": 1.582545610896466
+        },
+        {
+          "case": {
+            "layer": "o",
+            "load": "decode 1",
+            "m": 1,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 6688.00063431263,
+          "median_ns": 5159.503398202692,
+          "speedup": 1.2962489057846902,
+          "paired_ratio": 1.2962489057846902
+        },
+        {
+          "case": {
+            "layer": "pooler",
+            "load": "decode 1",
+            "m": 1,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 21568.000316619873,
+          "median_ns": 13613.014670610135,
+          "speedup": 1.5843661994417872,
+          "paired_ratio": 1.5843661994417872
+        },
+        {
+          "case": {
+            "layer": "unpooler",
+            "load": "decode 1",
+            "m": 1,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 7007.999811321497,
+          "median_ns": 3742.2311574274268,
+          "speedup": 1.8726795637442937,
+          "paired_ratio": 1.8726795637442937
+        },
+        {
+          "case": {
+            "layer": "router",
+            "load": "decode 1",
+            "m": 1,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 10303.999297320843,
+          "median_ns": 3712.6224916576966,
+          "speedup": 2.775396453712717,
+          "paired_ratio": 2.775396453712717
+        },
+        {
+          "case": {
+            "layer": "qkv_gate",
+            "load": "decode 16",
+            "m": 16,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 13935.999479144812,
+          "median_ns": 9643.294723058281,
+          "speedup": 1.4451491818270528,
+          "paired_ratio": 1.4451491818270528
+        },
+        {
+          "case": {
+            "layer": "o",
+            "load": "decode 16",
+            "m": 16,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 6703.999824821949,
+          "median_ns": 5636.867820013125,
+          "speedup": 1.1893129374118159,
+          "paired_ratio": 1.1893129374118159
+        },
+        {
+          "case": {
+            "layer": "pooler",
+            "load": "decode 16",
+            "m": 16,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 21279.99858930707,
+          "median_ns": 13836.336534517251,
+          "speedup": 1.5379792574588116,
+          "paired_ratio": 1.5379792574588116
+        },
+        {
+          "case": {
+            "layer": "unpooler",
+            "load": "decode 16",
+            "m": 16,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 18464.000429958105,
+          "median_ns": 13744.550364093617,
+          "speedup": 1.3433688218854813,
+          "paired_ratio": 1.3433688218854813
+        },
+        {
+          "case": {
+            "layer": "router",
+            "load": "decode 16",
+            "m": 16,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 14751.999638974667,
+          "median_ns": 4411.616592725073,
+          "speedup": 3.34389884726186,
+          "paired_ratio": 3.34389884726186
+        },
+        {
+          "case": {
+            "layer": "qkv_gate",
+            "load": "decode 32",
+            "m": 32,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 14512.000605463982,
+          "median_ns": 15129.191591330939,
+          "speedup": 0.9592052898437343,
+          "paired_ratio": 0.9592052898437343
+        },
+        {
+          "case": {
+            "layer": "o",
+            "load": "decode 32",
+            "m": 32,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 6719.999946653843,
+          "median_ns": 5884.315737327715,
+          "speedup": 1.1420189273707537,
+          "paired_ratio": 1.1420189273707537
+        },
+        {
+          "case": {
+            "layer": "pooler",
+            "load": "decode 32",
+            "m": 32,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 21727.999672293663,
+          "median_ns": 14775.319792752973,
+          "speedup": 1.47056036532968,
+          "paired_ratio": 1.47056036532968
+        },
+        {
+          "case": {
+            "layer": "unpooler",
+            "load": "decode 32",
+            "m": 32,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 18784.000538289547,
+          "median_ns": 15054.325882531417,
+          "speedup": 1.2477477028769473,
+          "paired_ratio": 1.2477477028769473
+        },
+        {
+          "case": {
+            "layer": "router",
+            "load": "decode 32",
+            "m": 32,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 15296.000521630049,
+          "median_ns": 5311.812179564738,
+          "speedup": 2.879619987407657,
+          "paired_ratio": 2.879619987407657
+        },
+        {
+          "case": {
+            "layer": "qkv_gate",
+            "load": "verify 1",
+            "m": 8,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 14336.00066229701,
+          "median_ns": 9350.07145240087,
+          "speedup": 1.53325038586907,
+          "paired_ratio": 1.53325038586907
+        },
+        {
+          "case": {
+            "layer": "o",
+            "load": "verify 1",
+            "m": 8,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 6720.00041231513,
+          "median_ns": 5425.272488353613,
+          "speedup": 1.238647538301698,
+          "paired_ratio": 1.238647538301698
+        },
+        {
+          "case": {
+            "layer": "pooler",
+            "load": "verify 1",
+            "m": 8,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 21439.99934196472,
+          "median_ns": 13740.393003618165,
+          "speedup": 1.5603628903714086,
+          "paired_ratio": 1.5603628903714086
+        },
+        {
+          "case": {
+            "layer": "unpooler",
+            "load": "verify 1",
+            "m": 8,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 7071.999832987785,
+          "median_ns": 4227.803502529854,
+          "speedup": 1.6727361687353746,
+          "paired_ratio": 1.6727361687353743
+        },
+        {
+          "case": {
+            "layer": "router",
+            "load": "verify 1",
+            "m": 8,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 26367.999147623777,
+          "median_ns": 4278.416190556379,
+          "speedup": 6.163028086380441,
+          "paired_ratio": 6.163028086380441
+        },
+        {
+          "case": {
+            "layer": "qkv_gate",
+            "load": "verify 16",
+            "m": 128,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 16944.000963121653,
+          "median_ns": 15877.950626350952,
+          "speedup": 1.0671402980055555,
+          "paired_ratio": 1.0671402980055555
+        },
+        {
+          "case": {
+            "layer": "o",
+            "load": "verify 16",
+            "m": 128,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 7391.999941319227,
+          "median_ns": 6767.017528549443,
+          "speedup": 1.0923571440642852,
+          "paired_ratio": 1.0923571440642852
+        },
+        {
+          "case": {
+            "layer": "pooler",
+            "load": "verify 16",
+            "m": 128,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 24863.998871296644,
+          "median_ns": 19894.1017707835,
+          "speedup": 1.2498176171900326,
+          "paired_ratio": 1.2498176171900326
+        },
+        {
+          "case": {
+            "layer": "unpooler",
+            "load": "verify 16",
+            "m": 128,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 20095.998886972666,
+          "median_ns": 18805.300050926442,
+          "speedup": 1.0686348440360374,
+          "paired_ratio": 1.0686348440360374
+        },
+        {
+          "case": {
+            "layer": "router",
+            "load": "verify 16",
+            "m": 128,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 16335.999127477407,
+          "median_ns": 5855.036307076196,
+          "speedup": 2.790076486414658,
+          "paired_ratio": 2.790076486414658
+        },
+        {
+          "case": {
+            "layer": "qkv_gate",
+            "load": "verify 32",
+            "m": 256,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 20144.000183790922,
+          "median_ns": 17594.750137463063,
+          "speedup": 1.1448869706253997,
+          "paired_ratio": 1.1448869706253997
+        },
+        {
+          "case": {
+            "layer": "o",
+            "load": "verify 32",
+            "m": 256,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 9631.999768316746,
+          "median_ns": 8965.650155772104,
+          "speedup": 1.074322508793815,
+          "paired_ratio": 1.074322508793815
+        },
+        {
+          "case": {
+            "layer": "pooler",
+            "load": "verify 32",
+            "m": 256,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 30720.0001552701,
+          "median_ns": 24291.209454784268,
+          "speedup": 1.2646550272621213,
+          "paired_ratio": 1.2646550272621213
+        },
+        {
+          "case": {
+            "layer": "unpooler",
+            "load": "verify 32",
+            "m": 256,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 24288.000538945198,
+          "median_ns": 23039.974332126454,
+          "speedup": 1.054167864461486,
+          "paired_ratio": 1.054167864461486
+        },
+        {
+          "case": {
+            "layer": "router",
+            "load": "verify 32",
+            "m": 256,
+            "weight": 62
+          },
+          "status": "pass",
+          "baseline_ns": 17663.999926298857,
+          "median_ns": 7162.408995311362,
+          "speedup": 2.4662093351359884,
+          "paired_ratio": 2.4662093351359884
+        }
+      ],
+      "measured_sha256": "752ddb2c6f25eafaa2d26d2af6a59b826080b1d1765c5335b457cac061eb03bd"
+    },
+    {
+      "problem": "muse_prefill_layer",
+      "source": "submissions/muse_prefill_layer.py",
+      "sha256": "7e6c241edc842c7b9eaaa24bf51e8923f3b7659eda79d3e3ecce8b38b0fea9d7",
+      "job_id": "4d6d78725b744746",
+      "mode": "run",
+      "summary": {
+        "status": "ok",
+        "passed": true,
+        "error": null,
+        "speedup": 1.9113601397732332,
+        "speedup_ci": [
+          1.8826897376766347,
+          1.9400305418698314
+        ],
+        "score_us": 202684.93202226257,
+        "tests": 5,
+        "tests_passed": 5
+      },
+      "benchmarks": [
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "sliding",
+            "load": "turn 1",
+            "page": 1,
+            "q_len": 753,
+            "repeats": 6,
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 1199888.0333267152,
+          "median_ns": 616585.9946780415,
+          "speedup": 1.9460189554796041,
+          "paired_ratio": 1.9460189554796041
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "full",
+            "load": "turn 1",
+            "page": 1,
+            "q_len": 753,
+            "repeats": 6,
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 1534304.0078878403,
+          "median_ns": 812322.8841764447,
+          "speedup": 1.8887858975478204,
+          "paired_ratio": 1.8887858975478204
+        },
+        {
+          "case": {
+            "batch": 4,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "sliding",
+            "load": "turn 4",
+            "page": 1,
+            "q_len": 753,
+            "repeats": 6,
+            "weight": 46
+          },
+          "status": "pass",
+          "baseline_ns": 3423952.1035924554,
+          "median_ns": 1812359.1358981428,
+          "speedup": 1.8892238496073035,
+          "paired_ratio": 1.8892238496073035
+        },
+        {
+          "case": {
+            "batch": 4,
+            "ctx": 80000,
+            "dist": "soft",
+            "layer": "full",
+            "load": "turn 4",
+            "page": 1,
+            "q_len": 753,
+            "repeats": 6,
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 4894336.046651006,
+          "median_ns": 2626833.7091790484,
+          "speedup": 1.8632074156611187,
+          "paired_ratio": 1.863207415661119
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 0,
+            "dist": "soft",
+            "layer": "full",
+            "load": "first turn",
+            "page": 1,
+            "q_len": 16384,
+            "repeats": 6,
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 18205120.533239096,
+          "median_ns": 9428489.154034734,
+          "speedup": 1.930862966040384,
+          "paired_ratio": 1.9308629660403838
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 32768,
+            "dist": "soft",
+            "layer": "sliding",
+            "load": "first turn",
+            "page": 1,
+            "q_len": 16384,
+            "repeats": 6,
+            "weight": 138
+          },
+          "status": "pass",
+          "baseline_ns": 17554672.37625271,
+          "median_ns": 9123134.5995881,
+          "speedup": 1.9241930703341028,
+          "paired_ratio": 1.9241930703341026
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 32768,
+            "dist": "soft",
+            "layer": "full",
+            "load": "first turn",
+            "page": 1,
+            "q_len": 16384,
+            "repeats": 6,
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 21130704.49559018,
+          "median_ns": 11007518.204986472,
+          "speedup": 1.9196610990857,
+          "paired_ratio": 1.9196610990856997
+        },
+        {
+          "case": {
+            "batch": 1,
+            "ctx": 65536,
+            "dist": "soft",
+            "layer": "full",
+            "load": "first turn",
+            "page": 1,
+            "q_len": 16384,
+            "repeats": 6,
+            "weight": 16
+          },
+          "status": "pass",
+          "baseline_ns": 24630544.580053538,
+          "median_ns": 12706734.849516245,
+          "speedup": 1.9383850274479633,
+          "paired_ratio": 1.9383850274479633
+        }
+      ],
+      "measured_sha256": "83c608305e0b56e87d761ead4a293fb26611ade390e90a17166410b811492c3a"
+    }
+  ],
+  "source_note": "measured_sha256 identifies the scored source; sha256 identifies the file after comment and label cleanup."
+}

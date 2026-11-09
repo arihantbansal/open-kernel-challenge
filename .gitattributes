@@ -1,0 +1,2 @@
+# Preserve submission bytes across checkout platforms.
+submissions/*.py -text

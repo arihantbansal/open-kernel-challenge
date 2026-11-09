@@ -1,0 +1,40 @@
+#!/bin/zsh
+# Run at most two Docker containers across all agents (two 6 GB dock slots fit the 12 GB OrbStack VM), always with
+# --rm and a memory cap.
+# Usage: tools/dock <image> <command...>   (mounts the current directory at /w)
+# Example: tools/dock nvidia/cuda:12.9.1-devel-ubuntu24.04 nvcc -arch=sm_90a -Xptxas -v -c k.cu -o /dev/null
+#
+# Serialization (tools/precheck takes the same lock and label):
+# - The lock is a kernel fcntl lock on $LOCK, so it is released the moment its holder exits, however it
+#   exits; there is no stale lock to break. (The old mkdir/pid lock raced: two waiters could both see a dead
+#   holder, and the second `rm -rf` removed the lock the first had just taken.)
+# - Two slots, $LOCK and $LOCK.2; precheck (10 GB) holds both. A holder killed with SIGKILL leaves its container
+#   running on the daemon. Every container gets the label okc.dock, dock containers also okc.dock.slot=<slot>; a new
+#   holder waits until no container of its own slot and no slotless one (a precheck's) is running.
+zmodload zsh/system
+LOCK=${OKC_DOCK_LOCK:-/tmp/okc-release-docker.flock}
+: >> $LOCK; : >> $LOCK.2
+slot=
+said=0
+while [[ -z $slot ]]; do
+  if zsystem flock -t 0 -f lockfd $LOCK 2>/dev/null; then slot=1
+  elif zsystem flock -t 0 -f lockfd $LOCK.2 2>/dev/null; then slot=2
+  else
+    (( said++ == 0 )) && echo "dock: waiting for another agent's container" >&2
+    sleep 2
+  fi
+done
+blockers() {
+  docker ps --filter label=okc.dock --format '{{.ID}} {{.Label "okc.dock.slot"}}' | awk -v s=$slot '$2 == "" || $2 == s {print $1}'
+}
+waited=0
+while [[ -n $(blockers) ]]; do
+  (( waited % 60 == 0 )) && echo "dock: waiting for okc container(s) $(blockers | xargs) (a precheck, or left by a killed run)" >&2
+  sleep 5; (( waited += 5 ))
+done
+name=okc-dock-$$
+trap 'docker rm -f $name >/dev/null 2>&1; exit 130' INT TERM HUP
+image=$1; shift
+# In the background so a signal to this script runs the trap now, not after the container exits.
+docker run --rm --label okc.dock --label okc.dock.slot=$slot --name $name --memory=6g -v "$PWD":/w -w /w "$image" "$@" &
+wait $!
